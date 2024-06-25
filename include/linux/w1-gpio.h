@@ -17,6 +17,7 @@ struct w1_gpio_platform_data {
 	struct gpio_desc *pullup_gpiod;
 	void (*enable_external_pullup)(int enable);
 	unsigned int pullup_duration;
+	int overdrive_mode; // Added speedmode parameter
 };
 
 #endif /* _LINUX_W1_GPIO_H */

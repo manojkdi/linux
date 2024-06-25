@@ -89,7 +89,7 @@ static int w1_gpio_probe(struct platform_device *pdev)
 		/*
 		 * This parameter means that something else than the gpiolib has
 		 * already set the line into open drain mode, so we should just
-		 * driver it high/low like we are in full control of the line and
+		 * drive it high/low like we are in full control of the line and
 		 * open drain will happen transparently.
 		 */
 		if (of_property_present(np, "linux,open-drain"))
@@ -97,6 +97,26 @@ static int w1_gpio_probe(struct platform_device *pdev)
 
 		if (of_property_present(np, "raspberrypi,delay-needs-poll"))
 			master->delay_needs_poll = true;
+
+		pr_info("Reading overdrive_mode parameter.\n");
+        /* Read the overdrive_mode from the device tree */
+        if (of_find_property(np, "overdrive_mode", NULL)) {
+            u32 overdrive_mode_val;
+            if (!of_property_read_u32(np, "overdrive_mode", &overdrive_mode_val)) {
+                pdata->overdrive_mode = overdrive_mode_val; // Directly assign the integer value
+                dev_info(dev, "Overdrive mode set to: %u\n", pdata->overdrive_mode);
+            } else {
+                /* Error handling if unable to read overdrive_mode property */
+                pdata->overdrive_mode = 0;  // Default to 0 or handle accordingly
+                dev_warn(dev, "Failed to read overdrive_mode property. Defaulting to 0.\n");
+            }
+        } else {
+            /* Default behavior if overdrive_mode property is not present */
+            pdata->overdrive_mode = 0;  // Default to 0 or handle accordingly
+            dev_info(dev, "Overdrive mode property not found. Defaulting to 0.\n");
+        }
+
+		master->overdrive_mode = pdata->overdrive_mode;
 
 		pdev->dev.platform_data = pdata;
 	}

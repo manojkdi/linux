@@ -37,12 +37,14 @@ struct w1_reg_num {
 #define W1_ALARM_SEARCH		0xEC
 #define W1_CONVERT_TEMP		0x44
 #define W1_SKIP_ROM		0xCC
+#define W1_OD_SKIP_ROM		0x3C
 #define W1_COPY_SCRATCHPAD	0x48
 #define W1_WRITE_SCRATCHPAD	0x4E
 #define W1_READ_SCRATCHPAD	0xBE
 #define W1_READ_ROM		0x33
 #define W1_READ_PSUPPLY		0xB4
 #define W1_MATCH_ROM		0x55
+#define W1_OD_MATCH_ROM		0x69
 #define W1_RESUME_CMD		0xA5
 
 /**
@@ -160,6 +162,8 @@ struct w1_bus_master {
 	char		*dev_id;
 
 	bool		delay_needs_poll;
+
+	int		overdrive_mode;
 };
 
 /**
@@ -243,6 +247,8 @@ struct w1_master {
 	struct w1_bus_master	*bus_master;
 
 	u32			seq;
+	int			overdrive_mode_active;
+
 };
 
 int w1_add_master_device(struct w1_bus_master *master);

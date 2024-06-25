@@ -37,22 +37,63 @@ static u8 w1_crc8_table[] = {
 	116, 42, 200, 150, 21, 75, 169, 247, 182, 232, 10, 84, 215, 137, 107, 53
 };
 
-static void w1_delay(struct w1_master *dev, unsigned long tm)
+static unsigned long delay_values[10][2] =    {{6 * 1000,    .5 * 1000},
+                                               {64 * 1000,  7.5 * 1000},
+                                               {60 * 1000,   7.5 * 1000},
+                                               {10 * 1000,   2.5 * 1000},
+                                               {9 * 1000,    .5 * 1000},
+                                               {55 * 1000,   7 * 1000},
+                                               {0 * 1000,    2.5 * 1000},
+                                               {480 * 1000, 70 * 1000},
+                                               {70 * 1000,   8.5 * 1000},
+                                               {410 * 1000, 40 * 1000}
+                                              };
+/**
+ * @brief This function implements a delay for 1-Wire communication.
+ *
+ * The function calculates the delay time in microseconds and nanoseconds based on the input parameter.
+ * It then checks if the bus master requires polling. If not, it simply applies the delay.
+ * If polling is required, it enters a loop where it reads a bit from the bus master and applies a short delay,
+ * repeating this process until the desired delay time has been reached.
+ *
+ * @param dev Pointer to the 1-Wire master device structure.
+ * @param tm The desired delay time in microseconds.
+ *
+ * For more details, please refer to the following resource:
+ * [1-Wire Communication Through Software](https://www.analog.com/en/resources/technical-articles/1wire-communication-through-software.html)
+ */
+static void w1_delay(struct w1_master *dev, unsigned long delay_ns)
 {
-	ktime_t start, delta;
+    ktime_t start, delta;
+    unsigned long delay_us, delay_remainder_ns;
 
-	if (!dev->bus_master->delay_needs_poll) {
-		udelay(tm * w1_delay_parm);
-		return;
-	}
+    if (!dev->bus_master->delay_needs_poll) {
+        delay_us = delay_ns / 1000; // convert nanoseconds to microseconds
+        delay_remainder_ns = delay_ns % 1000; // remainder in nanoseconds
 
-	start = ktime_get();
-	delta = ktime_add(start, ns_to_ktime(1000 * tm * w1_delay_parm));
-	do {
-		dev->bus_master->read_bit(dev->bus_master->data);
-		udelay(1);
-	} while (ktime_before(ktime_get(), delta));
+        if (delay_us > 0)
+            udelay(delay_us * w1_delay_parm);
+        if (delay_remainder_ns > 0)
+            ndelay(delay_remainder_ns * w1_delay_parm);
+
+        return;
+    }
+
+    start = ktime_get();
+    delta = ktime_add(start, ns_to_ktime(delay_ns * w1_delay_parm));
+    do {
+        dev->bus_master->read_bit(dev->bus_master->data);
+        if (delay_ns > 1000) {
+            udelay(1); // delay of 1 microsecond
+            delay_ns -= 1000;
+        } else {
+            ndelay(delay_ns); // delay of remaining nanoseconds
+            delay_ns = 0;
+        }
+    } while (ktime_before(ktime_get(), delta));
 }
+
+
 
 static void w1_write_bit(struct w1_master *dev, int bit);
 static u8 w1_read_bit(struct w1_master *dev);
@@ -90,14 +131,15 @@ static void w1_write_bit(struct w1_master *dev, int bit)
 
 	if (bit) {
 		dev->bus_master->write_bit(dev->bus_master->data, 0);
-		w1_delay(dev, 6);
+		w1_delay(dev, delay_values[0][dev->overdrive_mode_active]);
 		dev->bus_master->write_bit(dev->bus_master->data, 1);
-		w1_delay(dev, 64);
+		w1_delay(dev, delay_values[1][dev->overdrive_mode_active]);
 	} else {
 		dev->bus_master->write_bit(dev->bus_master->data, 0);
-		w1_delay(dev, 60);
+		w1_delay(dev, delay_values[2][dev->overdrive_mode_active]);
+
 		dev->bus_master->write_bit(dev->bus_master->data, 1);
-		w1_delay(dev, 10);
+		w1_delay(dev, delay_values[3][dev->overdrive_mode_active]);
 	}
 
 	if(w1_disable_irqs) local_irq_restore(flags);
@@ -177,14 +219,13 @@ static u8 w1_read_bit(struct w1_master *dev)
 	/* sample timing is critical here */
 	local_irq_save(flags);
 	dev->bus_master->write_bit(dev->bus_master->data, 0);
-	w1_delay(dev, 6);
+	w1_delay(dev, delay_values[0][dev->overdrive_mode_active]);
 	dev->bus_master->write_bit(dev->bus_master->data, 1);
-	w1_delay(dev, 9);
-
+	w1_delay(dev, delay_values[4][dev->overdrive_mode_active]);
 	result = dev->bus_master->read_bit(dev->bus_master->data);
 	local_irq_restore(flags);
 
-	w1_delay(dev, 55);
+	w1_delay(dev, delay_values[5][dev->overdrive_mode_active]);
 
 	return result & 0x1;
 }
@@ -249,6 +290,8 @@ u8 w1_read_8(struct w1_master *dev)
 	else
 		for (i = 0; i < 8; ++i)
 			res |= (w1_touch_bit(dev,1) << i);
+
+	pr_info("W1 read byte: %02x\n", res); // print out the final result
 
 	return res;
 }
@@ -346,9 +389,9 @@ int w1_reset_bus(struct w1_master *dev)
 		 * cpu for such a short amount of time AND get it back in
 		 * the maximum amount of time.
 		 */
-		w1_delay(dev, 500);
+		w1_delay(dev, delay_values[7][dev->overdrive_mode_active]);
 		dev->bus_master->write_bit(dev->bus_master->data, 1);
-		w1_delay(dev, 70);
+		w1_delay(dev, delay_values[8][dev->overdrive_mode_active]);
 
 		result = dev->bus_master->read_bit(dev->bus_master->data) & 0x1;
 		/* minimum 70 (above) + 430 = 500 us
@@ -358,6 +401,41 @@ int w1_reset_bus(struct w1_master *dev)
 		/* w1_delay(dev, 430); min required time */
 		msleep(1);
 	}
+
+	/* In case the bus is  selected for overdrive mode and
+	 * overdrive mode is not active  then send overdrive skip rom
+	 * to switch to overdrive mode and then issue a reset
+	 */
+	if((dev->bus_master->overdrive_mode == 1) && (dev->overdrive_mode_active == 0))
+    {
+    	w1_write_8(dev, W1_OD_SKIP_ROM);
+    	dev->overdrive_mode_active = 1;
+		if (dev->bus_master->reset_bus)
+		    result = dev->bus_master->reset_bus(dev->bus_master->data) & 0x1;
+	    else
+		{
+		    dev->bus_master->write_bit(dev->bus_master->data, 0);
+		    /* minimum 480, max ? us
+		     * be nice and sleep, except 18b20 spec lists 960us maximum,
+		     * so until we can sleep with microsecond accuracy, spin.
+		     * Feel free to come up with some other way to give up the
+		     * cpu for such a short amount of time AND get it back in
+		     * the maximum amount of time.
+		     */
+		    w1_delay(dev, delay_values[7][dev->overdrive_mode_active]);
+		    dev->bus_master->write_bit(dev->bus_master->data, 1);
+		    w1_delay(dev, delay_values[8][dev->overdrive_mode_active]);
+
+		    result = dev->bus_master->read_bit(dev->bus_master->data) & 0x1;
+		    /* minimum 70 (above) + 430 = 500 us
+		     * There aren't any timing requirements between a reset and
+		     * the following transactions.  Sleeping is safe here.
+		     */
+		    /* w1_delay(dev, 430); min required time */
+		    msleep(1);
+	    }
+    }
+
 
 	if(w1_disable_irqs) local_irq_restore(flags);
 
@@ -399,17 +477,50 @@ void w1_search_devices(struct w1_master *dev, u8 search_type, w1_slave_found_cal
  */
 int w1_reset_select_slave(struct w1_slave *sl)
 {
-	if (w1_reset_bus(sl->master))
-		return -1;
+	u8 match[9] = {};
 
-	if (sl->master->slave_count == 1)
-		w1_write_8(sl->master, W1_SKIP_ROM);
+    if (w1_reset_bus(sl->master))
+	    return -1;
+
+    if (sl->master->slave_count == 1)
+	{
+	    if((sl->master->bus_master->overdrive_mode == 0) || (sl->master->overdrive_mode_active ==  1))
+	    {
+		    	w1_write_8(sl->master, W1_SKIP_ROM);
+	    }
+	    else if((sl->master->bus_master->overdrive_mode == 1) && (sl->master->overdrive_mode_active ==  0))
+	    {
+	    	w1_write_8(sl->master, W1_OD_SKIP_ROM);
+	    	sl->master->overdrive_mode_active = 1;
+        	w1_write_8(sl->master, W1_SKIP_ROM);
+	    }
+	}
 	else {
-		u8 match[9] = {W1_MATCH_ROM, };
-		u64 rn = le64_to_cpu(*((u64*)&sl->reg_num));
+	    if((sl->master->bus_master->overdrive_mode == 0) || (sl->master->overdrive_mode_active ==  1))
+	    {
+		    match[0] = W1_MATCH_ROM;
+			u64 rn = le64_to_cpu(*((u64*)&sl->reg_num));
 
-		memcpy(&match[1], &rn, 8);
-		w1_write_block(sl->master, match, 9);
+		    memcpy(&match[1], &rn, 8);
+		    w1_write_block(sl->master, match, 9);
+	    }
+	    else if((sl->master->bus_master->overdrive_mode == 1) && (sl->master->overdrive_mode_active ==  0))
+	    {
+		    match[0] = W1_OD_MATCH_ROM;
+
+			match[0] = W1_MATCH_ROM;
+			u64 rn = le64_to_cpu(*((u64*)&sl->reg_num));
+
+		    memcpy(&match[1], &rn, 8);
+		    w1_write_block(sl->master, match, 9);
+
+			match[0] = W1_MATCH_ROM;
+			rn = le64_to_cpu(*((u64*)&sl->reg_num));
+
+		    memcpy(&match[1], &rn, 8);
+		    w1_write_block(sl->master, match, 9);
+	    }
+
 	}
 	return 0;
 }
