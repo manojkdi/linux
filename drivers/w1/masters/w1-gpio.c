@@ -95,8 +95,14 @@ static int w1_gpio_probe(struct platform_device *pdev)
 		if (of_property_present(np, "linux,open-drain"))
 			gflags = GPIOD_OUT_LOW;
 
-		if (of_property_present(np, "raspberrypi,delay-needs-poll"))
-			master->delay_needs_poll = true;
+        // Initialize delay_needs_poll based on the device tree property
+        if (of_property_present(np, "raspberrypi,delay-needs-poll")) {
+            master->delay_needs_poll = true;
+            dev_info(dev, "raspberrypi,delay-needs-poll property is present, setting delay_needs_poll to true\n");
+        } else {
+            master->delay_needs_poll = false;
+            dev_info(dev, "raspberrypi,delay-needs-poll property is not present, setting delay_needs_poll to false\n");
+        }
 
 		pr_info("Reading overdrive_mode parameter.\n");
         /* Read the overdrive_mode from the device tree */

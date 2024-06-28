@@ -12,10 +12,18 @@
 
 #include "w1_internal.h"
 
+#define AVERAGE_SAMPLES 100
+
+static s64 write_bit_0_avg_ns = 0;
+static s64 write_bit_1_avg_ns = 0;
+static s64 read_bit_avg_ns = 0;
+static s64 measurement_overhead_ns = 0;
+
+
 static int w1_delay_parm = 1;
 module_param_named(delay_coef, w1_delay_parm, int, 0);
 
-static int w1_disable_irqs = 0;
+static int w1_disable_irqs = 1;
 module_param_named(disable_irqs, w1_disable_irqs, int, 0);
 
 static u8 w1_crc8_table[] = {
@@ -37,17 +45,38 @@ static u8 w1_crc8_table[] = {
 	116, 42, 200, 150, 21, 75, 169, 247, 182, 232, 10, 84, 215, 137, 107, 53
 };
 
-static unsigned long delay_values[10][2] =    {{6 * 1000,    .5 * 1000},
+static unsigned long delay_values[10][2] =    {{6 * 1000,    1 * 1000},
                                                {64 * 1000,  7.5 * 1000},
                                                {60 * 1000,   7.5 * 1000},
-                                               {10 * 1000,   2.5 * 1000},
-                                               {9 * 1000,    .5 * 1000},
+                                               {10 * 1000,   5 * 1000},
+                                               {9 * 1000,    .5 * 1000},//changed from 1 to .5 for overdrive
                                                {55 * 1000,   7 * 1000},
                                                {0 * 1000,    2.5 * 1000},
-                                               {480 * 1000, 70 * 1000},
-                                               {70 * 1000,   8.5 * 1000},
-                                               {410 * 1000, 40 * 1000}
+                                               {480 * 1000, 50 * 1000},//changed from 70 t0 50 for overdrive
+                                               {70 * 1000,   10 * 1000},
+                                               {485 * 1000,   50 * 1000}
                                               };
+
+static void update_average(s64 *avg, s64 new_value)
+{
+    *avg = ((*avg * (AVERAGE_SAMPLES - 1)) + new_value) / AVERAGE_SAMPLES;
+}
+
+static s64 measure_overhead(void)
+{
+    ktime_t start, end;
+    start = ktime_get();
+    end = ktime_get();
+    s64 overhead = ktime_to_ns(ktime_sub(end, start));
+
+    start = ktime_get();
+    update_average(&write_bit_0_avg_ns, 0);  // Dummy call to include averaging overhead
+    end = ktime_get();
+    overhead += ktime_to_ns(ktime_sub(end, start));
+
+    return overhead;
+}
+
 /**
  * @brief This function implements a delay for 1-Wire communication.
  *
@@ -66,6 +95,11 @@ static void w1_delay(struct w1_master *dev, unsigned long delay_ns)
 {
     ktime_t start, delta;
     unsigned long delay_us, delay_remainder_ns;
+
+	if(delay_ns == 0)
+	{
+		return;
+	}
 
     if (!dev->bus_master->delay_needs_poll) {
         delay_us = delay_ns / 1000; // convert nanoseconds to microseconds
@@ -125,24 +159,72 @@ EXPORT_SYMBOL_GPL(w1_touch_bit);
  */
 static void w1_write_bit(struct w1_master *dev, int bit)
 {
-	unsigned long flags = 0;
+    unsigned long flags = 0;
+    ktime_t start, end;
+    s64 elapsed_ns;
+    s64 delay_ns;
 
-	if(w1_disable_irqs) local_irq_save(flags);
+    // Measure overhead if not already done
+    if (measurement_overhead_ns == 0) {
+        measurement_overhead_ns = measure_overhead();
+    }
 
-	if (bit) {
-		dev->bus_master->write_bit(dev->bus_master->data, 0);
-		w1_delay(dev, delay_values[0][dev->overdrive_mode_active]);
-		dev->bus_master->write_bit(dev->bus_master->data, 1);
-		w1_delay(dev, delay_values[1][dev->overdrive_mode_active]);
-	} else {
-		dev->bus_master->write_bit(dev->bus_master->data, 0);
-		w1_delay(dev, delay_values[2][dev->overdrive_mode_active]);
+    if (w1_disable_irqs)
+        local_irq_save(flags);
 
-		dev->bus_master->write_bit(dev->bus_master->data, 1);
-		w1_delay(dev, delay_values[3][dev->overdrive_mode_active]);
-	}
+    if (bit) {
+        // Measure time taken by write_bit(0)
+        start = ktime_get();
+        dev->bus_master->write_bit(dev->bus_master->data, 0);
+        end = ktime_get();
+        elapsed_ns = ktime_to_ns(ktime_sub(end, start)) - measurement_overhead_ns;
+        update_average(&write_bit_0_avg_ns, elapsed_ns);
 
-	if(w1_disable_irqs) local_irq_restore(flags);
+        // Adjust delay for the next write_bit call
+        delay_ns = delay_values[0][dev->overdrive_mode_active] - write_bit_0_avg_ns;
+        if (delay_ns > 0)
+            w1_delay(dev, delay_ns);
+
+        // Measure time taken by write_bit(1)
+        start = ktime_get();
+        dev->bus_master->write_bit(dev->bus_master->data, 1);
+        end = ktime_get();
+        elapsed_ns = ktime_to_ns(ktime_sub(end, start)) - measurement_overhead_ns;
+        update_average(&write_bit_1_avg_ns, elapsed_ns);
+
+        // Adjust delay for the next operation
+        delay_ns = delay_values[1][dev->overdrive_mode_active] - write_bit_1_avg_ns;
+        if (delay_ns > 0)
+            w1_delay(dev, delay_ns);
+
+    } else {
+        // Measure time taken by write_bit(0)
+        start = ktime_get();
+        dev->bus_master->write_bit(dev->bus_master->data, 0);
+        end = ktime_get();
+        elapsed_ns = ktime_to_ns(ktime_sub(end, start)) - measurement_overhead_ns;
+        update_average(&write_bit_0_avg_ns, elapsed_ns);
+
+        // Adjust delay for the next write_bit call
+        delay_ns = delay_values[2][dev->overdrive_mode_active] - write_bit_0_avg_ns;
+        if (delay_ns > 0)
+            w1_delay(dev, delay_ns);
+
+        // Measure time taken by write_bit(1)
+        start = ktime_get();
+        dev->bus_master->write_bit(dev->bus_master->data, 1);
+        end = ktime_get();
+        elapsed_ns = ktime_to_ns(ktime_sub(end, start)) - measurement_overhead_ns;
+        update_average(&write_bit_1_avg_ns, elapsed_ns);
+
+        // Adjust delay for the next operation
+        delay_ns = delay_values[3][dev->overdrive_mode_active] - write_bit_1_avg_ns;
+        if (delay_ns > 0)
+            w1_delay(dev, delay_ns);
+    }
+
+    if (w1_disable_irqs)
+        local_irq_restore(flags);
 }
 
 /**
@@ -213,21 +295,59 @@ EXPORT_SYMBOL_GPL(w1_write_8);
  */
 static u8 w1_read_bit(struct w1_master *dev)
 {
-	int result;
-	unsigned long flags = 0;
+    int result;
+    unsigned long flags = 0;
+    ktime_t start, end;
+    s64 elapsed_ns;
+    s64 delay_ns;
 
-	/* sample timing is critical here */
-	local_irq_save(flags);
-	dev->bus_master->write_bit(dev->bus_master->data, 0);
-	w1_delay(dev, delay_values[0][dev->overdrive_mode_active]);
-	dev->bus_master->write_bit(dev->bus_master->data, 1);
-	w1_delay(dev, delay_values[4][dev->overdrive_mode_active]);
-	result = dev->bus_master->read_bit(dev->bus_master->data);
-	local_irq_restore(flags);
+    // Measure overhead if not already done
+    if (measurement_overhead_ns == 0) {
+        measurement_overhead_ns = measure_overhead();
+    }
 
-	w1_delay(dev, delay_values[5][dev->overdrive_mode_active]);
+    /* sample timing is critical here */
+    local_irq_save(flags);
 
-	return result & 0x1;
+    // Measure time taken by write_bit(0)
+    start = ktime_get();
+    dev->bus_master->write_bit(dev->bus_master->data, 0);
+    end = ktime_get();
+    elapsed_ns = ktime_to_ns(ktime_sub(end, start)) - measurement_overhead_ns;
+    update_average(&write_bit_0_avg_ns, elapsed_ns);
+
+    // Adjust delay for the next write_bit call
+    delay_ns = delay_values[0][dev->overdrive_mode_active] - write_bit_0_avg_ns;
+    if (delay_ns > 0)
+        w1_delay(dev, delay_ns);
+
+    // Measure time taken by write_bit(1)
+    start = ktime_get();
+    dev->bus_master->write_bit(dev->bus_master->data, 1);
+    end = ktime_get();
+    elapsed_ns = ktime_to_ns(ktime_sub(end, start)) - measurement_overhead_ns;
+    update_average(&write_bit_1_avg_ns, elapsed_ns);
+
+    // Adjust delay for the next read_bit call
+    delay_ns = delay_values[4][dev->overdrive_mode_active] - write_bit_1_avg_ns;
+    if (delay_ns > 0)
+        w1_delay(dev, delay_ns);
+
+    // Measure time taken by read_bit
+    start = ktime_get();
+    result = dev->bus_master->read_bit(dev->bus_master->data);
+    end = ktime_get();
+    elapsed_ns = ktime_to_ns(ktime_sub(end, start)) - measurement_overhead_ns;
+    update_average(&read_bit_avg_ns, elapsed_ns);
+
+    local_irq_restore(flags);
+
+    // Adjust delay for the subsequent operation (if any)
+    delay_ns = delay_values[5][dev->overdrive_mode_active] - read_bit_avg_ns;
+    if (delay_ns > 0)
+        w1_delay(dev, delay_ns);
+
+    return result & 0x1;
 }
 
 /**
@@ -291,7 +411,7 @@ u8 w1_read_8(struct w1_master *dev)
 		for (i = 0; i < 8; ++i)
 			res |= (w1_touch_bit(dev,1) << i);
 
-	pr_info("W1 read byte: %02x\n", res); // print out the final result
+	//pr_info("W1 read byte: %02x\n", res); // print out the final result
 
 	return res;
 }
@@ -353,6 +473,7 @@ u8 w1_read_block(struct w1_master *dev, u8 *buf, int len)
 {
 	int i;
 	u8 ret;
+   	printk(KERN_DEBUG "read block started\n");
 
 	if (dev->bus_master->read_block)
 		ret = dev->bus_master->read_block(dev->bus_master->data, buf, len);
@@ -361,6 +482,8 @@ u8 w1_read_block(struct w1_master *dev, u8 *buf, int len)
 			buf[i] = w1_read_8(dev);
 		ret = len;
 	}
+
+	printk(KERN_DEBUG "read block complete\n");
 
 	return ret;
 }
@@ -373,73 +496,79 @@ EXPORT_SYMBOL_GPL(w1_read_block);
  */
 int w1_reset_bus(struct w1_master *dev)
 {
-	int result;
-	unsigned long flags = 0;
+    int result;
+    unsigned long flags = 0;
+    ktime_t ts_write_bit_0 = 0, ts_write_bit_1 = 0, ts_read_bit_start = 0, ts_read_bit_end = 0;
+    s64 read_bit_duration_ns;
 
-	if(w1_disable_irqs) local_irq_save(flags);
+    if (w1_disable_irqs)
+        local_irq_save(flags);
 
-	if (dev->bus_master->reset_bus)
-		result = dev->bus_master->reset_bus(dev->bus_master->data) & 0x1;
-	else {
-		dev->bus_master->write_bit(dev->bus_master->data, 0);
-		/* minimum 480, max ? us
-		 * be nice and sleep, except 18b20 spec lists 960us maximum,
-		 * so until we can sleep with microsecond accuracy, spin.
-		 * Feel free to come up with some other way to give up the
-		 * cpu for such a short amount of time AND get it back in
-		 * the maximum amount of time.
-		 */
-		w1_delay(dev, delay_values[7][dev->overdrive_mode_active]);
-		dev->bus_master->write_bit(dev->bus_master->data, 1);
-		w1_delay(dev, delay_values[8][dev->overdrive_mode_active]);
+    if (dev->bus_master->reset_bus) {
+        result = dev->bus_master->reset_bus(dev->bus_master->data) & 0x1;
+    } else {
+        // Write_bit(0)
+        w1_delay(dev, delay_values[6][dev->overdrive_mode_active]);
+        dev->bus_master->write_bit(dev->bus_master->data, 0);
+        ts_write_bit_0 = ktime_get();
 
-		result = dev->bus_master->read_bit(dev->bus_master->data) & 0x1;
-		/* minimum 70 (above) + 430 = 500 us
-		 * There aren't any timing requirements between a reset and
-		 * the following transactions.  Sleeping is safe here.
-		 */
-		/* w1_delay(dev, 430); min required time */
-		msleep(1);
-	}
+        // Write_bit(1)
+        w1_delay(dev, delay_values[7][dev->overdrive_mode_active]);
+        dev->bus_master->write_bit(dev->bus_master->data, 1);
+        ts_write_bit_1 = ktime_get();
 
-	/* In case the bus is  selected for overdrive mode and
-	 * overdrive mode is not active  then send overdrive skip rom
-	 * to switch to overdrive mode and then issue a reset
-	 */
-	if((dev->bus_master->overdrive_mode == 1) && (dev->overdrive_mode_active == 0))
-    {
-    	w1_write_8(dev, W1_OD_SKIP_ROM);
-    	dev->overdrive_mode_active = 1;
-		if (dev->bus_master->reset_bus)
-		    result = dev->bus_master->reset_bus(dev->bus_master->data) & 0x1;
-	    else
-		{
-		    dev->bus_master->write_bit(dev->bus_master->data, 0);
-		    /* minimum 480, max ? us
-		     * be nice and sleep, except 18b20 spec lists 960us maximum,
-		     * so until we can sleep with microsecond accuracy, spin.
-		     * Feel free to come up with some other way to give up the
-		     * cpu for such a short amount of time AND get it back in
-		     * the maximum amount of time.
-		     */
-		    w1_delay(dev, delay_values[7][dev->overdrive_mode_active]);
-		    dev->bus_master->write_bit(dev->bus_master->data, 1);
-		    w1_delay(dev, delay_values[8][dev->overdrive_mode_active]);
+        w1_delay(dev, delay_values[8][dev->overdrive_mode_active]);
 
-		    result = dev->bus_master->read_bit(dev->bus_master->data) & 0x1;
-		    /* minimum 70 (above) + 430 = 500 us
-		     * There aren't any timing requirements between a reset and
-		     * the following transactions.  Sleeping is safe here.
-		     */
-		    /* w1_delay(dev, 430); min required time */
-		    msleep(1);
-	    }
+        // Read_bit
+        ts_read_bit_start = ktime_get();
+        result = dev->bus_master->read_bit(dev->bus_master->data) & 0x1;
+        ts_read_bit_end = ktime_get();
+
+        w1_delay(dev, delay_values[9][dev->overdrive_mode_active]); // Delay after read_bit
     }
 
+    // Switch to overdrive mode and perform reset if required
+    if ((dev->bus_master->overdrive_mode == 1) && (dev->overdrive_mode_active == 0)) {
+        w1_write_8(dev, W1_OD_SKIP_ROM);
+        w1_delay(dev, 100); // Provide 100us of idle time before overdrive 1-Wire reset cycle.
+        dev->overdrive_mode_active = 1;
 
-	if(w1_disable_irqs) local_irq_restore(flags);
+        if (dev->bus_master->reset_bus) {
+            result = dev->bus_master->reset_bus(dev->bus_master->data) & 0x1;
+        } else {
+            // Write_bit(0) in overdrive mode
+            w1_delay(dev, delay_values[6][dev->overdrive_mode_active]);
+            dev->bus_master->write_bit(dev->bus_master->data, 0);
 
-	return result;
+            // Write_bit(1) in overdrive mode
+            w1_delay(dev, delay_values[7][dev->overdrive_mode_active]);
+            dev->bus_master->write_bit(dev->bus_master->data, 1);
+            ts_write_bit_1 = ktime_get();
+
+            w1_delay(dev, delay_values[8][dev->overdrive_mode_active]);
+
+            // Read_bit in overdrive mode
+            ts_read_bit_start = ktime_get();
+            result = dev->bus_master->read_bit(dev->bus_master->data) & 0x1;
+            ts_read_bit_end = ktime_get();
+
+            w1_delay(dev, delay_values[9][dev->overdrive_mode_active]); // Delay after read_bit (overdrive mode)
+        }
+    }
+
+    if (w1_disable_irqs)
+        local_irq_restore(flags);
+
+    // Calculate read_bit duration
+    read_bit_duration_ns = ktime_to_ns(ktime_sub(ts_read_bit_end, ts_read_bit_start));
+
+    // Print timestamps and result (example, adjust for your logging mechanism)
+    printk(KERN_INFO "Timestamps: Write_bit(0): %lld ns, Write_bit(1): %lld ns, Read_bit start: %lld ns, Read_bit end: %lld ns\n",
+           ktime_to_ns(ts_write_bit_0), ktime_to_ns(ts_write_bit_1), ktime_to_ns(ts_read_bit_start), ktime_to_ns(ts_read_bit_end));
+    printk(KERN_INFO "Read_bit duration: %lld ns\n", read_bit_duration_ns);
+    printk(KERN_INFO "Result: %d\n", result);
+
+    return result;
 }
 EXPORT_SYMBOL_GPL(w1_reset_bus);
 
@@ -456,6 +585,7 @@ EXPORT_SYMBOL_GPL(w1_calc_crc8);
 
 void w1_search_devices(struct w1_master *dev, u8 search_type, w1_slave_found_callback cb)
 {
+	printk(KERN_DEBUG "search devices called\n");
 	dev->attempts++;
 	if (dev->bus_master->search)
 		dev->bus_master->search(dev->bus_master->data, dev,
@@ -478,6 +608,7 @@ void w1_search_devices(struct w1_master *dev, u8 search_type, w1_slave_found_cal
 int w1_reset_select_slave(struct w1_slave *sl)
 {
 	u8 match[9] = {};
+	printk(KERN_DEBUG "reset select slave called\n");
 
     if (w1_reset_bus(sl->master))
 	    return -1;
@@ -491,6 +622,8 @@ int w1_reset_select_slave(struct w1_slave *sl)
 	    else if((sl->master->bus_master->overdrive_mode == 1) && (sl->master->overdrive_mode_active ==  0))
 	    {
 	    	w1_write_8(sl->master, W1_OD_SKIP_ROM);
+			//After overdrive skip provide 100us of idle time before overdrive 1-Wire reset cycle.
+    	    w1_delay(sl->master, 100);
 	    	sl->master->overdrive_mode_active = 1;
         	w1_write_8(sl->master, W1_SKIP_ROM);
 	    }
