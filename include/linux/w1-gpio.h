@@ -13,11 +13,16 @@ struct gpio_desc;
  * struct w1_gpio_platform_data - Platform-dependent data for w1-gpio
  */
 struct w1_gpio_platform_data {
-	struct gpio_desc *gpiod;
-	struct gpio_desc *pullup_gpiod;
-	void (*enable_external_pullup)(int enable);
-	unsigned int pullup_duration;
-	int overdrive_mode; // Added speedmode parameter
+    struct gpio_desc *gpiod;
+    struct gpio_desc *pullup_gpiod;
+    void (*enable_external_pullup)(int enable);
+    unsigned int pullup_duration;
+    int overdrive_mode;
+    u64 write_bit_0_avg_ns;
+    u64 write_bit_1_avg_ns;
+    u64 read_bit_avg_ns;
+    u64 w1_delay_values[10][2];
 };
+
 
 #endif /* _LINUX_W1_GPIO_H */

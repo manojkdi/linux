@@ -14,6 +14,29 @@
                 gpios = <&gpio 4 0>;
                 status = "okay";
                 overdrive_mode = <1>; // Default overdrive mode enabled
+
+                // Default timing values for 1-Wire communication (in nanoseconds)
+                // These values are inspired by the article from Analog Devices:
+                // https://www.analog.com/en/resources/technical-articles/1wire-communication-through-software.html
+                w1_delay_values = /bits/ 64 <
+                    6000    1000    // Initialization low pulse duration and release
+                    64000   7500    // Presence detect wait and sample
+                    60000   7500    // Recovery time between commands
+                    10000   5000    // Write 1 low pulse and recovery
+                    9000    1000    // Write 0 low pulse and recovery
+                    55000   7000    // Read low pulse and sample
+                    0       2500    // Bus idle time between operations
+                    480000  50000   // Initialization high pulse duration and recovery
+                    70000   10000   // Overdrive initialization low pulse and release
+                    485000  50000   // Overdrive presence detect wait and sample
+                >;
+
+                // Average timing values for writing bits (in nanoseconds)
+                write_bit_0_avg_ns = /bits/ 64 <500>; // Average time to write a '0' bit
+                write_bit_1_avg_ns = /bits/ 64 <500>; // Average time to write a '1' bit
+
+                // Average timing values for reading bits (in nanoseconds)
+                read_bit_avg_ns = /bits/ 64 <300>; // Average time to read a bit
             };
         };
     };
