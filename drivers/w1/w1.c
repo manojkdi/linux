@@ -37,6 +37,11 @@ module_param_named(timeout_us, w1_timeout_us, int, 0);
 MODULE_PARM_DESC(timeout_us,
 		 "time in microseconds between automatic slave searches");
 
+static int w1_overdrive_mode = 0;
+module_param_named(overdrive_mode, w1_overdrive_mode, int, 0);
+MODULE_PARM_DESC(overdrive_mode,
+		 "used to switch the master speed mode");
+
 /* A search stops when w1_max_slave_count devices have been found in that
  * search.  The next search will start over and detect the same set of devices
  * on a static 1-wire bus.  Memory is not allocated based on this number, just
@@ -281,6 +286,50 @@ static ssize_t w1_master_attribute_show_pullup(struct device *dev,
 
 	return count;
 }
+
+static ssize_t w1_master_attribute_store_overdrive_mode(struct device *dev,
+                                                        struct device_attribute *attr,
+                                                        const char *buf, size_t count)
+{
+    long tmp;
+    struct w1_master *md = dev_to_w1_master(dev);
+    int ret;
+
+    ret = kstrtol(buf, 0, &tmp);
+    if (ret)
+        return ret;
+
+    mutex_lock(&md->mutex);
+    if (md->bus_master->supports_overdrive_mode) {
+        md->overdrive_mode = tmp;
+        w1_reset_bus(md);
+    } else {
+        ret = -EINVAL; // Invalid argument error
+    }
+    mutex_unlock(&md->mutex);
+
+    return ret ? ret : count;
+}
+
+
+static ssize_t w1_master_attribute_show_overdrive_mode(struct device *dev,
+                                                       struct device_attribute *attr,
+                                                       char *buf)
+{
+    struct w1_master *md = dev_to_w1_master(dev);
+    ssize_t count = 0;
+
+    mutex_lock(&md->mutex);
+    if (md->bus_master->supports_overdrive_mode) { // Assuming this is the flag that indicates support
+        count = sprintf(buf, "%d\n", md->overdrive_mode);
+    } else {
+        count = sprintf(buf, "Overdrive mode not supported\n");
+    }
+    mutex_unlock(&md->mutex);
+
+    return count;
+}
+
 
 static ssize_t w1_master_attribute_show_pointer(struct device *dev, struct device_attribute *attr, char *buf)
 {
@@ -536,6 +585,7 @@ static W1_MASTER_ATTR_RW(search, S_IRUGO | S_IWUSR | S_IWGRP);
 static W1_MASTER_ATTR_RW(pullup, S_IRUGO | S_IWUSR | S_IWGRP);
 static W1_MASTER_ATTR_RW(add, S_IRUGO | S_IWUSR | S_IWGRP);
 static W1_MASTER_ATTR_RW(remove, S_IRUGO | S_IWUSR | S_IWGRP);
+static W1_MASTER_ATTR_RW(overdrive_mode, S_IRUGO | S_IWUSR | S_IWGRP);
 
 static struct attribute *w1_master_default_attrs[] = {
 	&w1_master_attribute_name.attr,
@@ -550,6 +600,7 @@ static struct attribute *w1_master_default_attrs[] = {
 	&w1_master_attribute_pullup.attr,
 	&w1_master_attribute_add.attr,
 	&w1_master_attribute_remove.attr,
+	&w1_master_attribute_overdrive_mode.attr,
 	NULL
 };
 

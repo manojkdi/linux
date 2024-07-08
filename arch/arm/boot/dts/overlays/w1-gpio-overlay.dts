@@ -13,7 +13,6 @@
                 pinctrl-0 = <&w1_pins>;
                 gpios = <&gpio 4 0>;
                 status = "okay";
-                overdrive_mode = <1>; // Default overdrive mode enabled
 
                 // Default timing values for 1-Wire communication (in nanoseconds)
                 // These values are inspired by the article from Analog Devices:

@@ -163,7 +163,7 @@ struct w1_bus_master {
 
 	bool		delay_needs_poll;
 
-	int		overdrive_mode;
+	bool        supports_overdrive_mode;
 };
 
 /**
@@ -247,7 +247,9 @@ struct w1_master {
 	struct w1_bus_master	*bus_master;
 
 	u32			seq;
-	int			overdrive_mode_active;
+	int			overdrive_mode;
+    int			overdrive_mode_active;
+
 
 };
 

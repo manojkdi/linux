@@ -104,21 +104,8 @@ static int w1_gpio_probe(struct platform_device *pdev)
             dev_info(dev, "raspberrypi,delay-needs-poll property is not present, setting delay_needs_poll to false\n");
         }
 
-        pr_info("Reading overdrive_mode parameter.\n");
-        /* Read the overdrive_mode from the device tree */
-        if (of_find_property(np, "overdrive_mode", NULL)) {
-            if (!of_property_read_u32(np, "overdrive_mode", &pdata->overdrive_mode)) {
-                dev_info(dev, "Overdrive mode set to: %u\n", pdata->overdrive_mode);
-            } else {
-                /* Error handling if unable to read overdrive_mode property */
-                pdata->overdrive_mode = 0;  // Default to 0 or handle accordingly
-                dev_warn(dev, "Failed to read overdrive_mode property. Defaulting to 0.\n");
-            }
-        } else {
-            /* Default behavior if overdrive_mode property is not present */
-            pdata->overdrive_mode = 0;  // Default to 0 or handle accordingly
-            dev_info(dev, "Overdrive mode property not found. Defaulting to 0.\n");
-        }
+        // GPIO master supports overdriver mode
+        master->supports_overdrive_mode = true;
 
         // Read and handle optional properties with default values
         if (of_find_property(np, "write_bit_0_avg_ns", NULL)) {
@@ -207,8 +194,6 @@ static int w1_gpio_probe(struct platform_device *pdev)
 
             memcpy(pdata->w1_delay_values, w1_delay_values, sizeof(w1_delay_values));
         }
-
-        master->overdrive_mode = pdata->overdrive_mode;
 
         pdev->dev.platform_data = pdata;
     }

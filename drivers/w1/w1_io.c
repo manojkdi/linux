@@ -452,10 +452,16 @@ int w1_reset_bus(struct w1_master *dev)
         result = dev->bus_master->read_bit(dev->bus_master->data) & 0x1;
 
         w1_delay(dev, pdata->w1_delay_values[9][dev->overdrive_mode_active] - pdata->read_bit_avg_ns); // Delay after read_bit
+
+        // if reset is issue to reset the bus to standard mode then clear flags
+		if (!dev->overdrive_mode && dev->overdrive_mode_active)
+		{
+		    dev->overdrive_mode_active = 0;
+		}
     }
 
     // Switch to overdrive mode and perform reset if required
-    if (dev->bus_master->overdrive_mode && !dev->overdrive_mode_active) {
+    if (dev->overdrive_mode && !dev->overdrive_mode_active) {
         w1_write_8(dev, W1_OD_SKIP_ROM);
         w1_delay(dev, 100); // Provide 100us of idle time before overdrive 1-Wire reset cycle.
         dev->overdrive_mode_active = 1;
@@ -479,6 +485,7 @@ int w1_reset_bus(struct w1_master *dev)
             w1_delay(dev, pdata->w1_delay_values[9][dev->overdrive_mode_active]); // Delay after read_bit (overdrive mode)
         }
     }
+
 
     if (w1_disable_irqs)
         local_irq_restore(flags);
@@ -530,11 +537,11 @@ int w1_reset_select_slave(struct w1_slave *sl)
 
     if (sl->master->slave_count == 1)
 	{
-	    if((sl->master->bus_master->overdrive_mode == 0) || (sl->master->overdrive_mode_active ==  1))
+	    if((sl->master->overdrive_mode == 0) || (sl->master->overdrive_mode_active ==  1))
 	    {
 		    	w1_write_8(sl->master, W1_SKIP_ROM);
 	    }
-	    else if((sl->master->bus_master->overdrive_mode == 1) && (sl->master->overdrive_mode_active ==  0))
+	    else if((sl->master->overdrive_mode == 1) && (sl->master->overdrive_mode_active ==  0))
 	    {
 	    	w1_write_8(sl->master, W1_OD_SKIP_ROM);
 			//After overdrive skip provide 100us of idle time before overdrive 1-Wire reset cycle.
@@ -544,7 +551,7 @@ int w1_reset_select_slave(struct w1_slave *sl)
 	    }
 	}
 	else {
-	    if((sl->master->bus_master->overdrive_mode == 0) || (sl->master->overdrive_mode_active ==  1))
+	    if((sl->master->overdrive_mode == 0) || (sl->master->overdrive_mode_active ==  1))
 	    {
 		    match[0] = W1_MATCH_ROM;
 			u64 rn = le64_to_cpu(*((u64*)&sl->reg_num));
@@ -552,7 +559,7 @@ int w1_reset_select_slave(struct w1_slave *sl)
 		    memcpy(&match[1], &rn, 8);
 		    w1_write_block(sl->master, match, 9);
 	    }
-	    else if((sl->master->bus_master->overdrive_mode == 1) && (sl->master->overdrive_mode_active ==  0))
+	    else if((sl->master->overdrive_mode == 1) && (sl->master->overdrive_mode_active ==  0))
 	    {
 		    match[0] = W1_OD_MATCH_ROM;
 
