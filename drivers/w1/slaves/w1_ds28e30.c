@@ -8,7 +8,11 @@
 #include <linux/types.h>
 #include <linux/moduleparam.h>
 #include <linux/ktime.h>
-
+#include <linux/crypto.h>
+#include <linux/err.h>
+#include <linux/scatterlist.h>
+#include <crypto/hash.h>
+#include <crypto/akcipher.h>
 #include <linux/w1.h>
 
 
@@ -62,9 +66,9 @@
 
 /** @brief Delays */
 #define DELAY_DS28E30_EE_WRITE_TWM               100
-#define DELAY_DS28E30_EE_READ_TRM                50
-#define DELAY_DS28E30_ECDSA_GEN_TGES             200
-#define DELAY_DS28E30_Verify_ECDSA_Signature_tEVS 200
+#define DELAY_DS28E30_EE_READ_TRM                75
+#define DELAY_DS28E30_ECDSA_GEN_TGES             205
+#define DELAY_DS28E30_VER_ECDSA_SIG_TVES         250
 #define DELAY_DS28E30_ECDSA_WRITE                350
 
 /** @brief Protection bit fields */
@@ -81,12 +85,21 @@
 #define ECDSA_USE_PUF                            0x01
 
 /** @brief macros for bin attributes */
-#define ROM_SIZE 32
-#define MAN_ID_HWREV_SIZE 32 // Example size, adjust according to your needs
-#define PROTECTION_PAGE0_SIZE 32 // the data is passed as string so each charecter is a byte
-#define PRIVATE_KEY_SIZE 32 // the data is passed as string so each charecter is a byte
-#define PUBLIC_KEY_PART_SIZE 32 // the data is passed as string so each charecter is a byte
-#define DS28E30_PAGE_SIZE 32 // the data is passed as string so each charecter is a byte
+#define ROM_SIZE                                 8
+#define MAN_ID_HWREV_SIZE                        4 // Example size, adjust according to your needs
+#define PROTECTION_PAGE0_SIZE                    32
+#define PRIVATE_KEY_SIZE                         32
+#define PUBLIC_KEY_PART_SIZE                     32
+#define DS28E30_PAGE_SIZE                        32
+#define SIG_R_SIZE                               32
+#define SIG_S_SIZE                               32
+#define ECDSA_AUTH_WRITE_MEM_SIZE                97
+#define READ_PG_AUTH_SIG_SIZE                    64
+#define CHALLENGE_LENGTH                         8
+#define SHA256_DIGEST_SIZE  32
+
+#define ECDSA_P256                               "ecdsa-nist-p256"
+#define SHA256                                   "sha256"
 
 
 // Global variable for last result byte (assuming it's defined somewhere in your context)
@@ -97,12 +110,26 @@ u8 hardware_version[2];
 unsigned short crc_16;
 static u8 crc_8;
 static short odd_parity[16] = { 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0 };
+static u8 verify_ecdsa_certificate_result = -1;
+static bool verify_ecdsa_certificate_peformed = false;
+
+//Certificate CA Public Key DS28E30 CA Keys
+u8 CA_publicKeyX[] = { 0x2E,0x75,0x76,0xB1,0x34,0x3E,0xF4,0xE4,0xFB,0x93,0x69,0x79,0x2E,0x7A,0x2E,0x83,0x97,0x58,0x14,0xCA,0x49,0x95,0x84,0x84,0xD7,0xFA,0x3E,0xB7,0xA0,0x65,0x7C,0x5C };
+u8 CA_publicKeyY[] = { 0x69,0xC9,0x37,0xF4,0xE0,0x6E,0x37,0x1D,0xAF,0x17,0x52,0x49,0xF7,0xD5,0xCF,0x4D,0x5C,0xDF,0x4F,0xD2,0x21,0x0D,0x20,0x53,0x2D,0x17,0xA9,0xF3,0xBB,0x08,0x2B,0xD2 };
+u8 CA_constans[] = { 0xEC,0x81,0x75,0x28,0x11,0x24,0x0D,0x6F,0x9F,0x30,0xC8,0x83,0x0B,0xFF,0x53,0xA0 };
 
 
 // keys in byte array format, used by software compute functions
 u8 private_key[32];
 u8 public_key_x[32];
 u8 public_key_y[32];
+
+// variables for storing device certificate
+u8 certR[32];
+u8 certS[32];
+
+//array storing read page authentication signature
+u8 rd_pg_auth_sig[READ_PG_AUTH_SIG_SIZE];
 
 //local static functions
 static int w1_ds28e30_standard_cmd_flow(struct w1_slave *sl, u8 *write_buf, int write_len, int delay_ms, int expect_read_len, u8 *read_buf, int *read_len);
@@ -294,7 +321,7 @@ int w1_ds28e30_cmd_writeMemory(struct w1_slave *sl, int pg, u8 *data)
    return -1;
 }
 
-int ds28e30_cmd_readMemory(struct w1_slave *sl, int pg, u8 *data)
+int w1_ds28e30_cmd_readMemory(struct w1_slave *sl, int pg, u8 *data)
 {
    u8 write_buf[10];
    int write_len;
@@ -350,6 +377,51 @@ int ds28e30_cmd_readMemory(struct w1_slave *sl, int pg, u8 *data)
    return -1;
 }
 
+int w1_ds28e30_cmd_decrementCounter(struct w1_slave *sl)
+{
+   int write_len;
+   u8 write_buf[10];
+   u8 read_buf[255];
+   int read_len;
+
+   /*
+     Presence Pulse
+     <ROM Select>
+   TX: XPC Command (66h)
+   TX: Length byte 1d
+   TX: XPC sub-command C9h (Decrement Counter)
+   RX: CRC16 (inverted of XPC command, length, sub-command)
+   TX: Release Byte
+     <Delay TBD>
+   RX: Dummy Byte
+   RX: Length Byte (1d)
+   RX: Result Byte
+   RX: CRC16 (inverted, length byte and result byte)
+     Reset or send XPC command (66h) for a new sequence
+   */
+
+   // construct the write buffer
+   write_len = 0;
+   write_buf[write_len++] = CMD_DECREMENT_CNT;
+
+   // preload read_len with expected length
+   read_len = 1;
+
+   // default failure mode
+   last_result_byte = RESULT_FAIL_COMMUNICATION;
+
+   if (0 == w1_ds28e30_standard_cmd_flow(sl, write_buf, write_len,  DELAY_DS28E30_EE_WRITE_TWM+50, read_len, read_buf, &read_len))
+   {
+      // get result byte
+      last_result_byte = read_buf[0];
+      // check result byte
+      if (read_len == 1)
+         return !(read_buf[0] == RESULT_SUCCESS);
+   }
+
+   // no payload in read buffer or failed command
+   return -1;
+}
 int w1_ds28e30_cmd_readStatus(struct w1_slave *sl, int pg, u8 *pr_data, u8 *man_id, u8 *hardware_version) {
    u8 write_buf[10];
    u8 read_buf[255];
@@ -410,15 +482,69 @@ int w1_ds28e30_cmd_readStatus(struct w1_slave *sl, int pg, u8 *pr_data, u8 *man_
    return -1;
 }
 
+int w1_ds28e30_cmd_device_disable(struct w1_slave *sl, u8 parameter, u8 *release_sequence)
+{
+   u8 write_buf[10];
+   int write_len;
+   u8 read_buf[255];
+   int read_len;
+
+   /*
+     Reset
+     Presence Pulse
+     <ROM Select>
+   TX: XPC Command (66h)
+   TX: Length byte 9d
+   TX: XPC sub-command 33h (Disable command)
+   TX: Release Sequence (8 bytes)
+   RX: CRC16 (inverted of XPC command, length, sub-command, and release sequence)
+   TX: Release Byte
+     <Delay TBD>
+   RX: Dummy Byte
+   RX: Length Byte (1d)
+   RX: Result Byte
+   RX: CRC16 (inverted, length byte and result byte)
+     Reset or send XPC command (66h) for a new sequence
+   */
+
+   // construct the write buffer
+   write_len = 0;
+   write_buf[write_len++] = CMD_DISABLE_DEVICE;
+   write_buf[write_len++] = parameter;
+   memcpy(&write_buf[write_len], release_sequence, 8);
+   write_len += 8;
+
+   // preload read_len with expected length
+   read_len = 1;
+
+   // default failure mode
+   last_result_byte = RESULT_FAIL_COMMUNICATION;
+
+   if (0 == w1_ds28e30_standard_cmd_flow(sl, write_buf, write_len,  DELAY_DS28E30_EE_WRITE_TWM, read_len, read_buf, &read_len))
+   {
+      // get result byte
+      last_result_byte = read_buf[0];
+      // check result
+      if (read_len == 1)
+         return !(read_buf[0] == RESULT_SUCCESS);
+   }
+
+   // no payload in read buffer or failed command
+   return -1;
+}
+
+
 static ssize_t rom_read(struct file *filp, struct kobject *kobj,
                         struct bin_attribute *bin_attr, char *buf,
                         loff_t off, size_t count)
 {
-    struct w1_slave *sl = kobj_to_w1_slave(kobj);
     u8 i;
     ssize_t ret = 0;
+    u8 rom_no[8];
 
-    if (off != 0 || count < 17) { // Ensure enough space for 16 bytes (2 hex digits per byte + 1 space)
+    struct w1_slave *sl = kobj_to_w1_slave(kobj);
+
+    if (off != 0 || count < 8) { // Ensure enough space for 8 bytes of ROM data
         return 0; // Return 0 to signify end of file or no data read
     }
     if (!buf) {
@@ -428,21 +554,14 @@ static ssize_t rom_read(struct file *filp, struct kobject *kobj,
     memset(rom_no, 0, sizeof(rom_no));
 
     if (w1_reset_bus(sl->master) == 0) {
-
         w1_write_8(sl->master, 0x33); // Read ROM command
         for (i = 0; i < 8; i++) {
             rom_no[i] = w1_read_8(sl->master);
         }
 
-        // Format ROM data into a hexadecimal string with spaces
-        ret = snprintf(buf, count, "%02x %02x %02x %02x %02x %02x %02x %02x\n",
-                       rom_no[0], rom_no[1], rom_no[2], rom_no[3],
-                       rom_no[4], rom_no[5], rom_no[6], rom_no[7]);
-
-        if (ret < 0 || ret >= count) {
-            ret = -EFAULT; // Error formatting data
-        } else {
-        }
+        // Copy ROM data directly to the buffer
+        memcpy(buf, rom_no, sizeof(rom_no));
+        ret = sizeof(rom_no);
     } else {
         ret = -EIO; // I/O error
     }
@@ -457,10 +576,10 @@ static ssize_t man_id_hwrev_read(struct file *filp, struct kobject *kobj,
     struct w1_slave *sl = kobj_to_w1_slave(kobj);
     u8 protection_byte;
     int ret;
-    int len = 0;
+    u8 man_id[2];
+    u8 hardware_version[2];
 
-
-    if (off != 0) {
+    if (off != 0 || count < 4) { // Ensure enough space for 4 bytes of data
         return 0;
     }
     if (!buf) {
@@ -468,18 +587,17 @@ static ssize_t man_id_hwrev_read(struct file *filp, struct kobject *kobj,
     }
 
     // Call the w1_ds28e30_cmd_readStatus function
-    ret = w1_ds28e30_cmd_readStatus(sl, 0x80 | 0, &protection_byte, man_id, hardware_version);  // page number=0
+    ret = w1_ds28e30_cmd_readStatus(sl, 0x80 | PG_USER_EEPROM_0, &protection_byte, man_id, hardware_version); // page number=0
     if (ret < 0) {
-        len = sprintf(buf, "Error reading MANID and Hardware Revision: %d\n", ret);
-        return len;  // Return the number of bytes written to buf
+        return ret;
     }
 
-    // Print the MANID and hardware_version to the buffer
-    len = sprintf(buf, "MANID: 0x%02x%02x, Hardware Version: 0x%02x%02x\n",
-                  man_id[0], man_id[1], hardware_version[0], hardware_version[1]);
+    // Copy MANID and hardware_version data directly to the buffer
+    memcpy(buf, man_id, sizeof(man_id));
+    memcpy(buf + sizeof(man_id), hardware_version, sizeof(hardware_version));
 
     // Return the number of bytes written to buf
-    return len;
+    return sizeof(man_id) + sizeof(hardware_version);
 }
 
 
@@ -499,7 +617,7 @@ static ssize_t protection_page0_read(struct file *filp, struct kobject *kobj,
         return -EINVAL;
 
     // Call the w1_ds28e30_cmd_readStatus function
-    ret = w1_ds28e30_cmd_readStatus(sl, 0, &protection_byte, man_id, hardware_version);  // page number=0
+    ret = w1_ds28e30_cmd_readStatus(sl, PG_USER_EEPROM_0, &protection_byte, man_id, hardware_version);  // page number=0
     if (ret < 0) {
         len = sprintf(buf, "Error reading status: %d\n", ret);
         return len;  // Return the number of bytes written to buf
@@ -584,7 +702,7 @@ static ssize_t page0_write(struct file *filp, struct kobject *kobj,
                            loff_t off, size_t count)
 {
     struct w1_slave *sl = kobj_to_w1_slave(kobj);
-    u8 page0_data[DS28E30_PAGE_SIZE];  // Assuming DS28E30_PAGE_SIZE is defined elsewhere
+    u8 page_data[DS28E30_PAGE_SIZE];  // Assuming DS28E30_PAGE_SIZE is defined elsewhere
     int ret;
 
     if (off != 0 || count != DS28E30_PAGE_SIZE) {
@@ -595,10 +713,10 @@ static ssize_t page0_write(struct file *filp, struct kobject *kobj,
     }
 
     // Copy the data directly from user buffer
-    memcpy(page0_data, buf, DS28E30_PAGE_SIZE);
+    memcpy(page_data, buf, DS28E30_PAGE_SIZE);
 
     // Write page 0 data using w1_ds28e30_cmd_writeMemory
-    ret = w1_ds28e30_cmd_writeMemory(sl, 0, page0_data); // Page number 0
+    ret = w1_ds28e30_cmd_writeMemory(sl, PG_USER_EEPROM_0, page_data); // Page number 0
     if (ret < 0) {
         return ret;
     }
@@ -612,27 +730,25 @@ static ssize_t page0_read(struct file *filp, struct kobject *kobj,
                           loff_t off, size_t count)
 {
     struct w1_slave *sl = kobj_to_w1_slave(kobj);
-    u8 page0_data[DS28E30_PAGE_SIZE];  // Statically allocated buffer
+    u8 page_data[DS28E30_PAGE_SIZE];  // Statically allocated buffer
     int ret;
 
     if (off != 0) {
         return 0; // Only allow reads from the beginning
     }
-
     if (!buf) {
         return -EINVAL; // Null buffer pointer
     }
     if (count > DS28E30_PAGE_SIZE) {
         return -EINVAL; // Invalid count size
     }
-
-    // Read page 0 data using ds28e30_cmd_readMemory
-    ret = ds28e30_cmd_readMemory(sl, 0, page0_data); // Page number 0
+    // Read page 0 data using w1_ds28e30_cmd_readMemory
+    ret = w1_ds28e30_cmd_readMemory(sl, PG_USER_EEPROM_0, page_data); // Page number 0
     if (ret < 0) {
         return ret; // Return error code directly
     }
 
-    memcpy(buf, page0_data, sizeof(page0_data)/page0_data[0]);
+    memcpy(buf, page_data, count);
 
     return count; // Return number of bytes read
 }
@@ -642,7 +758,7 @@ static ssize_t page1_write(struct file *filp, struct kobject *kobj,
                            loff_t off, size_t count)
 {
     struct w1_slave *sl = kobj_to_w1_slave(kobj);
-    u8 page0_data[DS28E30_PAGE_SIZE];  // Assuming DS28E30_PAGE_SIZE is defined elsewhere
+    u8 page_data[DS28E30_PAGE_SIZE];  // Assuming DS28E30_PAGE_SIZE is defined elsewhere
     int ret;
 
     if (off != 0 || count != DS28E30_PAGE_SIZE) {
@@ -652,11 +768,12 @@ static ssize_t page1_write(struct file *filp, struct kobject *kobj,
         return -EINVAL;
     }
 
+
     // Copy the data directly from user buffer
-    memcpy(page0_data, buf, DS28E30_PAGE_SIZE);
+    memcpy(page_data, buf, DS28E30_PAGE_SIZE);
 
     // Write page 0 data using w1_ds28e30_cmd_writeMemory
-    ret = w1_ds28e30_cmd_writeMemory(sl, 1, page0_data); // Page number 0
+    ret = w1_ds28e30_cmd_writeMemory(sl, PG_USER_EEPROM_1, page_data); // Page number 1
     if (ret < 0) {
         return ret;
     }
@@ -670,7 +787,7 @@ static ssize_t page1_read(struct file *filp, struct kobject *kobj,
                           loff_t off, size_t count)
 {
     struct w1_slave *sl = kobj_to_w1_slave(kobj);
-    u8 page0_data[DS28E30_PAGE_SIZE];  // Statically allocated buffer
+    u8 page_data[DS28E30_PAGE_SIZE];  // Statically allocated buffer
     int ret;
 
     if (off != 0) {
@@ -684,13 +801,13 @@ static ssize_t page1_read(struct file *filp, struct kobject *kobj,
         return -EINVAL; // Invalid count size
     }
 
-    // Read page 0 data using ds28e30_cmd_readMemory
-    ret = ds28e30_cmd_readMemory(sl, 1, page0_data); // Page number 0
+    // Read page 0 data using w1_ds28e30_cmd_readMemory
+    ret = w1_ds28e30_cmd_readMemory(sl, PG_USER_EEPROM_1, page_data); // Page number 1
     if (ret < 0) {
         return ret; // Return error code directly
     }
 
-    memcpy(buf, page0_data, sizeof(page0_data)/page0_data[0]);
+    memcpy(buf, page_data, count);
 
     return count; // Return number of bytes read
 }
@@ -700,7 +817,7 @@ static ssize_t page2_write(struct file *filp, struct kobject *kobj,
                            loff_t off, size_t count)
 {
     struct w1_slave *sl = kobj_to_w1_slave(kobj);
-    u8 page0_data[DS28E30_PAGE_SIZE];  // Assuming DS28E30_PAGE_SIZE is defined elsewhere
+    u8 page_data[DS28E30_PAGE_SIZE];  // Assuming DS28E30_PAGE_SIZE is defined elsewhere
     int ret;
 
     if (off != 0 || count != DS28E30_PAGE_SIZE) {
@@ -711,10 +828,10 @@ static ssize_t page2_write(struct file *filp, struct kobject *kobj,
     }
 
     // Copy the data directly from user buffer
-    memcpy(page0_data, buf, DS28E30_PAGE_SIZE);
+    memcpy(page_data, buf, DS28E30_PAGE_SIZE);
 
     // Write page 0 data using w1_ds28e30_cmd_writeMemory
-    ret = w1_ds28e30_cmd_writeMemory(sl, 2, page0_data); // Page number 0
+    ret = w1_ds28e30_cmd_writeMemory(sl, PG_USER_EEPROM_2, page_data); // Page number 2
     if (ret < 0) {
         return ret;
     }
@@ -728,7 +845,7 @@ static ssize_t page2_read(struct file *filp, struct kobject *kobj,
                           loff_t off, size_t count)
 {
     struct w1_slave *sl = kobj_to_w1_slave(kobj);
-    u8 page0_data[DS28E30_PAGE_SIZE];  // Statically allocated buffer
+    u8 page_data[DS28E30_PAGE_SIZE];  // Statically allocated buffer
     int ret;
 
     if (off != 0) {
@@ -742,13 +859,13 @@ static ssize_t page2_read(struct file *filp, struct kobject *kobj,
         return -EINVAL; // Invalid count size
     }
 
-    // Read page 0 data using ds28e30_cmd_readMemory
-    ret = ds28e30_cmd_readMemory(sl, 2, page0_data); // Page number 0
+    // Read page 0 data using w1_ds28e30_cmd_readMemory
+    ret = w1_ds28e30_cmd_readMemory(sl, PG_USER_EEPROM_2, page_data); // Page number 2
     if (ret < 0) {
         return ret; // Return error code directly
     }
 
-    memcpy(buf, page0_data, sizeof(page0_data)/page0_data[0]);
+    memcpy(buf, page_data, count);
 
     return count; // Return number of bytes read
 }
@@ -758,7 +875,7 @@ static ssize_t page3_write(struct file *filp, struct kobject *kobj,
                            loff_t off, size_t count)
 {
     struct w1_slave *sl = kobj_to_w1_slave(kobj);
-    u8 page0_data[DS28E30_PAGE_SIZE];  // Assuming DS28E30_PAGE_SIZE is defined elsewhere
+    u8 page_data[DS28E30_PAGE_SIZE];  // Assuming DS28E30_PAGE_SIZE is defined elsewhere
     int ret;
 
     if (off != 0 || count != DS28E30_PAGE_SIZE) {
@@ -769,10 +886,10 @@ static ssize_t page3_write(struct file *filp, struct kobject *kobj,
     }
 
     // Copy the data directly from user buffer
-    memcpy(page0_data, buf, DS28E30_PAGE_SIZE);
+    memcpy(page_data, buf, DS28E30_PAGE_SIZE);
 
     // Write page 0 data using w1_ds28e30_cmd_writeMemory
-    ret = w1_ds28e30_cmd_writeMemory(sl, 3, page0_data); // Page number 0
+    ret = w1_ds28e30_cmd_writeMemory(sl, PG_USER_EEPROM_3, page_data); // Page number 3
     if (ret < 0) {
         return ret;
     }
@@ -786,7 +903,7 @@ static ssize_t page3_read(struct file *filp, struct kobject *kobj,
                           loff_t off, size_t count)
 {
     struct w1_slave *sl = kobj_to_w1_slave(kobj);
-    u8 page0_data[DS28E30_PAGE_SIZE];  // Statically allocated buffer
+    u8 page_data[DS28E30_PAGE_SIZE];  // Statically allocated buffer
     int ret;
 
     if (off != 0) {
@@ -800,16 +917,662 @@ static ssize_t page3_read(struct file *filp, struct kobject *kobj,
         return -EINVAL; // Invalid count size
     }
 
-    // Read page 0 data using ds28e30_cmd_readMemory
-    ret = ds28e30_cmd_readMemory(sl, 3, page0_data); // Page number 0
+    // Read page 0 data using w1_ds28e30_cmd_readMemory
+    ret = w1_ds28e30_cmd_readMemory(sl, PG_USER_EEPROM_3, page_data); // Page number 3
     if (ret < 0) {
         return ret; // Return error code directly
     }
 
-    memcpy(buf, page0_data, sizeof(page0_data)/page0_data[0]);
+    memcpy(buf, page_data, count);
 
     return count; // Return number of bytes read
 }
+
+static ssize_t ds28e30_pub_key_read(struct file *filp, struct kobject *kobj,
+                          struct bin_attribute *bin_attr, char *buf,
+                          loff_t off, size_t count)
+{
+    struct w1_slave *sl = kobj_to_w1_slave(kobj);
+    u8 public_key[PUBLIC_KEY_PART_SIZE*2];  // Statically allocated buffer
+    int ret;
+
+    if (off != 0) {
+        return 0; // Only allow reads from the beginning
+    }
+
+    if (!buf) {
+        return -EINVAL; // Null buffer pointer
+    }
+    if (count > PUBLIC_KEY_PART_SIZE*2) {
+        return -EINVAL; // Invalid count size
+    }
+
+    // Read public_key_x
+    ret = w1_ds28e30_cmd_readMemory(sl, PG_DS28E30_PUB_KEY_X, public_key); // public_key_x
+    if (ret < 0) {
+        return ret; // Return error code directly
+    }
+    // Read public_key_y
+    ret = w1_ds28e30_cmd_readMemory(sl, PG_DS28E30_PUB_KEY_Y, public_key+PUBLIC_KEY_PART_SIZE); // public_key_y
+    if (ret < 0) {
+        return ret; // Return error code directly
+    }
+
+    memcpy(buf, public_key, count);
+
+    return count; // Return number of bytes read
+}
+
+static ssize_t page_decrement_counter_write(struct file *filp, struct kobject *kobj,
+                                            struct bin_attribute *bin_attr, char *buf,
+                                            loff_t off, size_t count)
+{
+    struct w1_slave *sl = kobj_to_w1_slave(kobj);
+    u8 page_data[DS28E30_PAGE_SIZE];  // Assuming DS28E30_PAGE_SIZE is defined elsewhere
+    int ret;
+
+    if (off != 0 || count != DS28E30_PAGE_SIZE) {
+        return -EINVAL;
+    }
+    if (!buf) {
+        return -EINVAL;
+    }
+
+    // Copy the data directly from user buffer
+    memcpy(page_data, buf, DS28E30_PAGE_SIZE);
+
+    // Write page 0 data using w1_ds28e30_cmd_writeMemory
+    ret = w1_ds28e30_cmd_writeMemory(sl, PG_DEC_COUNTER, page_data); // Page number 3
+    if (ret < 0) {
+        return ret;
+    }
+
+    return count; // Return number of bytes written
+}
+
+
+static ssize_t page_decrement_counter_read(struct file *filp, struct kobject *kobj,
+                          struct bin_attribute *bin_attr, char *buf,
+                          loff_t off, size_t count)
+{
+    struct w1_slave *sl = kobj_to_w1_slave(kobj);
+    u8 page_data[DS28E30_PAGE_SIZE];  // Statically allocated buffer
+    int ret;
+
+    if (off != 0) {
+        return 0; // Only allow reads from the beginning
+    }
+
+    if (!buf) {
+        return -EINVAL; // Null buffer pointer
+    }
+    if (count > DS28E30_PAGE_SIZE) {
+        return -EINVAL; // Invalid count size
+    }
+
+    // Read page 0 data using w1_ds28e30_cmd_readMemory
+    ret = w1_ds28e30_cmd_readMemory(sl, PG_DEC_COUNTER, page_data); // Page number 3
+    if (ret < 0) {
+        return ret; // Return error code directly
+    }
+
+    memcpy(buf, page_data, count);
+
+    return count; // Return number of bytes read
+}
+
+
+static ssize_t decrement_counter_write(struct file *filp, struct kobject *kobj,
+                                       struct bin_attribute *bin_attr, char *buf,
+                                       loff_t off, size_t count)
+{
+    struct w1_slave *sl = kobj_to_w1_slave(kobj);
+    int ret;
+
+
+    if (off != 0) {
+        return 0; // Only allow reads from the beginning
+    }
+
+    if (!buf) {
+        return -EINVAL; // Null buffer pointer
+    }
+
+    if (count == 0) {
+        return -EINVAL; // Invalid count size
+    }
+
+    // Perform the decrement counter operation
+    ret = w1_ds28e30_cmd_decrementCounter(sl); // Page number 3
+    if (ret < 0) {
+        return ret; // Return error code directly
+    }
+
+    return count; // Return number of bytes read
+}
+
+
+static ssize_t ds28e30_device_disable_write(struct file *filp, struct kobject *kobj,
+                                            struct bin_attribute *bin_attr, char *buf,
+                                            loff_t off, size_t count)
+{
+    struct w1_slave *sl = kobj_to_w1_slave(kobj);
+    u8 parameter, password[8];
+    int ret;
+
+    if (off != 0 || (count != 9)) {
+        return -EINVAL;
+    }
+    if (!buf) {
+        return -EINVAL;
+    }
+
+    parameter = buf[1];
+    // Copy the data directly from user buffer
+    memcpy(password, buf+1, 8);
+
+    // Write page 0 data using w1_ds28e30_cmd_writeMemory
+    ret = w1_ds28e30_cmd_device_disable(sl, parameter, password); // Page number 3
+    if (ret < 0) {
+        return ret;
+    }
+
+    return count; // Return number of bytes written
+}
+
+int w1_ds28e30_comp_rd_pg_auth(struct w1_slave *sl, int pg, u8 *challenge, u8 *sig)
+{
+   u8 write_buf[200];
+   int write_len;
+   u8 read_buf[255];
+   int read_len;
+
+   /*
+     Reset
+     Presence Pulse
+     <ROM Select>
+   TX: XPC Command (66h)
+   TX: Length byte 34d
+   TX: XPC sub-command A5h (Compute and Read Page Authentication)
+   TX: Parameter (page)
+   TX: Challenge (32d bytes)
+   RX: CRC16 (inverted of XPC command, length, sub-command, parameter, and challenge)
+   TX: Release Byte
+     <Delay TBD>
+   RX: Dummy Byte
+   RX: Length byte (65d)
+   RX: Result Byte
+   RX: Read ECDSA Signature (64 bytes, �s� and then �r�, MSByte first, [same as ES10]),
+        signature 00h's if result byte is not AA success
+   RX: CRC16 (inverted, length byte, result byte, and signature)
+     Reset or send XPC command (66h) for a new sequence
+   */
+
+   // construct the write buffer
+   write_len = 0;
+   write_buf[write_len++] = CMD_COMP_READ_AUTH;
+   write_buf[write_len] = pg&0x7f;
+   write_len++;
+   write_buf[write_len++] = 0x03; //authentication parameter
+   memcpy(&write_buf[write_len], challenge, 32);
+   write_len += 32;
+
+   // preload read_len with expected length
+   read_len = 65;
+
+   // default failure mode
+   last_result_byte = RESULT_FAIL_COMMUNICATION;
+
+   if (0 == w1_ds28e30_standard_cmd_flow(sl, write_buf, write_len,  DELAY_DS28E30_ECDSA_GEN_TGES, read_len, read_buf, &read_len))
+   {
+      // get result byte
+      last_result_byte = read_buf[0];
+      // check result
+      if (read_len == 65)
+      {
+         if (read_buf[0] == RESULT_SUCCESS)
+         {
+            memcpy(sig, &read_buf[1], 64);
+            return 0;
+         }
+      }
+   }
+
+   // no payload in read buffer or failed command
+   return -1;
+}
+
+
+static ssize_t ds28e30_comp_rd_pg_auth_write(struct file *filp, struct kobject *kobj,
+                                       struct bin_attribute *bin_attr, char *buf,
+                                       loff_t off, size_t count)
+{
+    struct w1_slave *sl = kobj_to_w1_slave(kobj);
+    int ret;
+    u8 pg, challenge[8];
+
+
+    if (off != 0 || (count != CHALLENGE_LENGTH + 1)) {
+        return 0; // Only allow reads from the beginning
+    }
+
+    if (!buf) {
+        return -EINVAL; // Null buffer pointer
+    }
+
+    if (count == 0) {
+        return -EINVAL; // Invalid count size
+    }
+
+    pg = buf[0];
+    memcpy(challenge, &buf[1], CHALLENGE_LENGTH);
+
+    // Perform the decrement counter operation
+    ret = w1_ds28e30_comp_rd_pg_auth(sl, pg, challenge, rd_pg_auth_sig); // Page number 3
+    if (ret < 0) {
+        return ret; // Return error code directly
+    }
+
+    return count; // Return number of bytes read
+}
+
+static ssize_t ds28e30_comp_rd_pg_auth_read(struct file *filp, struct kobject *kobj,
+                                       struct bin_attribute *bin_attr, char *buf,
+                                       loff_t off, size_t count)
+{
+    if (off != 0) {
+        return 0; // Only allow reads from the beginning
+    }
+
+    if (!buf) {
+        return -EINVAL; // Null buffer pointer
+    }
+
+    if (count == 0) {
+        return -EINVAL; // Invalid count size
+    }
+
+    memcpy(buf, rd_pg_auth_sig, READ_PG_AUTH_SIG_SIZE);
+
+    return count; // Return number of bytes read
+}
+
+
+int w1_ds28e30_cmd_auth_ecdsa_write_mem(struct w1_slave *sl, int pg, u8 *data, u8 *sig_r, u8 *sig_s )
+{
+   u8 write_buf[128];
+   int write_len;
+   u8 read_buf[16];
+   int read_len;
+
+   /*
+     Reset
+     Presence Pulse
+     <ROM Select>
+   TX: XPC Command (66h)
+   TX: Length byte 98d
+   TX: XPC sub-command 89h (authenticated Write Memory)
+   TX: Parameter
+   TX: New page data (32d bytes)
+   TX: Certificate R&S (64 bytes)
+   RX: CRC16 (inverted of XPC command, length, sub-command, parameter, page data, certificate R&S)
+   TX: Release Byte
+     <Delay TBD>
+   RX: Dummy Byte
+   RX: Length Byte (1d)
+   RX: Result Byte
+   RX: CRC16 (inverted of length and result byte)
+     Reset or send XPC command (66h) for a new sequence
+   */
+
+   // construct the write buffer
+   write_len = 0;
+   write_buf[write_len++] = CMD_AUTHENTICATE_WRITE;
+   write_buf[write_len++] = pg & 0x03;
+   memcpy(&write_buf[write_len], data, 32);
+   write_len += 32;
+   memcpy(&write_buf[write_len], sig_r, 32);
+   write_len += 32;
+   memcpy(&write_buf[write_len], sig_s, 32);
+   write_len += 32;
+
+
+   // preload read_len with expected length
+   read_len = 1;
+
+   // default failure mode
+   last_result_byte = RESULT_FAIL_COMMUNICATION;
+
+   if (0 == w1_ds28e30_standard_cmd_flow(sl, write_buf, write_len,  DELAY_DS28E30_EE_WRITE_TWM + DELAY_DS28E30_VER_ECDSA_SIG_TVES, read_len, read_buf, &read_len))
+   {
+      // get result byte
+      last_result_byte = read_buf[0];
+      // check result
+      if (read_len == 1)
+         return !(read_buf[0] == RESULT_SUCCESS);
+   }
+
+   // no payload in read buffer or failed command
+   return -1;
+}
+
+static ssize_t ds28e30_auth_ecdsa_write_mem_write(struct file *filp, struct kobject *kobj,
+                                       struct bin_attribute *bin_attr, char *buf,
+                                       loff_t off, size_t count)
+{
+    struct w1_slave *sl = kobj_to_w1_slave(kobj);
+    int ret;
+    u8 pg, new_data[DS28E30_PAGE_SIZE], sig_r[SIG_R_SIZE], sig_s[SIG_S_SIZE];
+
+
+    if (off != 0 || (count != ECDSA_AUTH_WRITE_MEM_SIZE)) {
+        return 0; // Only allow reads from the beginning
+    }
+
+    if (!buf) {
+        return -EINVAL; // Null buffer pointer
+    }
+
+    if (count == 0) {
+        return -EINVAL; // Invalid count size
+    }
+
+    pg = buf[0];
+    memcpy(new_data, &buf[1], DS28E30_PAGE_SIZE);
+    memcpy(sig_r, &buf[33], SIG_R_SIZE);
+    memcpy(sig_s, &buf[65], SIG_S_SIZE);
+
+    // Perform the decrement counter operation
+    ret = w1_ds28e30_cmd_auth_ecdsa_write_mem(sl, pg, new_data, sig_r, sig_s); // Page number 3
+    if (ret < 0) {
+        return ret; // Return error code directly
+    }
+
+    return count; // Return number of bytes read
+}
+
+int verify_ecdsa_signature(unsigned char *message, int msg_len,
+                           unsigned char *pubkey_x, unsigned char *pubkey_y,
+                           unsigned char *sig_r, unsigned char *sig_s)
+{
+    struct crypto_akcipher *tfm;
+    struct akcipher_request *req = NULL;
+    struct scatterlist src_sg[2];
+    unsigned char pub_key[65]; // 1 byte (uncompressed indicator) + 2*32 bytes (X and Y)
+    unsigned char sig[72];     // Up to 72 bytes for ASN.1 DER encoded signature
+    int ret = -EINVAL;
+    int sig_len = 0;           // Actual length of encoded signature
+    struct crypto_wait wait;
+    unsigned char hash[SHA256_DIGEST_SIZE]; // SHA256 hash size
+
+    struct crypto_shash *shash;
+    struct shash_desc *shash_desc;
+
+    if (!message || msg_len <= 0 || !pubkey_x || !pubkey_y || !sig_r || !sig_s) {
+        pr_err("Invalid input parameters\n");
+        return -EINVAL;
+    }
+
+    // Construct the public key in uncompressed format (0x04 + X + Y)
+    pub_key[0] = 0x04;
+    memcpy(pub_key + 1, pubkey_x, 32);
+    memcpy(pub_key + 33, pubkey_y, 32);
+
+    // Encode signature in ASN.1 DER format
+    sig[sig_len++] = 0x30; // Sequence tag
+
+    // Temporary length position (to be updated later)
+    int len_pos = sig_len++;
+    sig[sig_len++] = 0x02; // Integer tag for R
+
+    // Add leading zero byte for R if necessary
+    if (sig_r[0] & 0x80) {
+        sig[sig_len++] = 0x21; // Length of R (33 bytes)
+        sig[sig_len++] = 0x00; // Leading zero byte
+    } else {
+        sig[sig_len++] = 0x20; // Length of R (32 bytes)
+    }
+    memcpy(sig + sig_len, sig_r, 32);
+    sig_len += 32;
+
+    sig[sig_len++] = 0x02; // Integer tag for S
+
+    // Add leading zero byte for S if necessary
+    if (sig_s[0] & 0x80) {
+        sig[sig_len++] = 0x21; // Length of S (33 bytes)
+        sig[sig_len++] = 0x00; // Leading zero byte
+    } else {
+        sig[sig_len++] = 0x20; // Length of S (32 bytes)
+    }
+    memcpy(sig + sig_len, sig_s, 32);
+    sig_len += 32;
+
+    // Update the length of the sequence
+    sig[len_pos] = sig_len - 2;
+
+    // Hash the message with SHA-256
+    shash = crypto_alloc_shash(SHA256, 0, 0);
+    if (IS_ERR(shash)) {
+        pr_err("Failed to allocate shash: %ld\n", PTR_ERR(shash));
+        return PTR_ERR(shash);
+    }
+
+    shash_desc = kmalloc(sizeof(*shash_desc) + crypto_shash_descsize(shash), GFP_KERNEL);
+    if (!shash_desc) {
+        pr_err("Failed to allocate shash descriptor\n");
+        crypto_free_shash(shash);
+        return -ENOMEM;
+    }
+
+    shash_desc->tfm = shash;
+
+    ret = crypto_shash_digest(shash_desc, message, msg_len, hash);
+    if (ret) {
+        pr_err("Failed to hash message: %d\n", ret);
+        kfree(shash_desc);
+        crypto_free_shash(shash);
+        return ret;
+    }
+
+    kfree(shash_desc);
+    crypto_free_shash(shash);
+
+    // Allocate the ECDSA akcipher transform
+    tfm = crypto_alloc_akcipher(ECDSA_P256, 0, 0);
+    if (IS_ERR(tfm)) {
+        ret = PTR_ERR(tfm);
+        pr_err("Failed to allocate ECDSA transform: %d\n", ret);
+        return ret;
+    }
+
+    // Initialize the akcipher request
+    req = akcipher_request_alloc(tfm, GFP_KERNEL);
+    if (!req) {
+        pr_err("Failed to allocate akcipher request\n");
+        ret = -ENOMEM;
+        goto out_free_tfm;
+    }
+
+    crypto_init_wait(&wait);
+
+    // Set the public key
+    ret = crypto_akcipher_set_pub_key(tfm, pub_key, sizeof(pub_key));
+    if (ret) {
+        pr_err("Failed to set public key: %d\n", ret);
+        goto out_free_req;
+    }
+
+    // Set up scatter-gather list for input (hashed message + signature)
+    sg_init_table(src_sg, 2);
+    sg_set_buf(&src_sg[0], sig, sizeof(sig));
+    sg_set_buf(&src_sg[1], hash,sizeof(hash));
+
+    // Initialize scatter-gather list for output (not needed for ECDSA verification)
+    //sg_init_one(&dst_sg, NULL, 0); // ECDSA verification does not output data
+
+    // Set up akcipher request
+    akcipher_request_set_crypt(req, src_sg, NULL, sizeof(sig), sizeof(hash));
+    akcipher_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG, crypto_req_done, &wait);
+
+    // Verify the signature
+    ret = crypto_wait_req(crypto_akcipher_verify(req), &wait);
+    if (ret) {
+        pr_err("Signature verification failed: %d\n", ret);
+        goto out_free_req;
+    }
+
+out_free_req:
+    akcipher_request_free(req);
+out_free_tfm:
+    crypto_free_akcipher(tfm);
+
+    return ret == 0 ? 0 : -1;
+}
+
+
+int ds28e30_compute_verify_ecdsa_noread(struct w1_slave *sl, int pg, u8 *page_data, u8 *challenge, u8 *sig_r, u8 *sig_s)
+{
+   u8 signature[64], message[256];
+   int msg_len;
+   u8 *pubkey_x, *pubkey_y;
+
+   // compute and read auth command
+   if (!w1_ds28e30_comp_rd_pg_auth(sl, pg, challenge, signature))
+      return -1;
+
+   // put the signature in the return buffers, signature is 's' and then 'r', MSByte first
+   memcpy(sig_s,signature,32);
+   memcpy(sig_r,&signature[32],32);
+
+   // construct the message to hash for signature verification
+   // ROM NO | Page Data | Challenge (Buffer) | Page# | MANID
+
+   // ROM NO
+   msg_len = 0;
+   memcpy(&message[msg_len],rom_no,8);
+   msg_len += 8;
+   // Page Data
+   memcpy(&message[msg_len], page_data, 32);
+   msg_len += 32;
+   // Challenge (Buffer)
+   memcpy(&message[msg_len], challenge, 32);
+   msg_len += 32;
+   // Page#
+   message[msg_len++] = pg;
+   // MANID
+   memcpy(&message[msg_len], man_id, 2);
+   msg_len += 2;
+
+   pubkey_x = public_key_x;
+   pubkey_y = public_key_y;
+
+   // verify Signature and return result
+   return verify_ecdsa_signature(message, msg_len, pubkey_x, pubkey_y, sig_r, sig_s);
+}
+
+int ds28e30_compute_verify_ecdsa(struct w1_slave *sl, int pg, u8 *page_data, u8 *challenge, u8 *sig_r, u8 *sig_s)
+{
+   // read destination page
+   if (!w1_ds28e30_cmd_readMemory(sl, pg, page_data))
+      return -1;
+
+   return ds28e30_compute_verify_ecdsa_noread(sl, pg, page_data, challenge, sig_r, sig_s);
+}
+
+static ssize_t ds28e30_verify_ecdsa_certificate_write(struct file *filp, struct kobject *kobj,
+                                       struct bin_attribute *bin_attr, char *buf,
+                                       loff_t off, size_t count)
+{
+    struct w1_slave *sl = kobj_to_w1_slave(kobj);
+    int ret;
+    u8 ca_key, msg_len, *msg;
+
+    if (off != 0) {
+        return 0; // Only allow writes from the beginning
+    }
+
+    if (!buf) {
+        return -EINVAL; // Null buffer pointer
+    }
+
+    if (count == 0) {
+        return -EINVAL; // Invalid count size
+    }
+
+    ca_key = buf[0];
+    msg_len = buf[65];
+    msg = kmalloc(msg_len, GFP_KERNEL);
+    if (!msg) {
+        return -ENOMEM;
+    }
+    memcpy(msg, &buf[66], msg_len);
+
+    ret = w1_ds28e30_cmd_readMemory(sl, PG_CERTIFICATE_R, certR);
+    ret |= w1_ds28e30_cmd_readMemory(sl, PG_CERTIFICATE_S, certS);
+
+    if (ret == 0) {
+        if (ca_key) {
+            memcpy(public_key_x, CA_publicKeyX, 32); // set the sw Public Key X
+            memcpy(public_key_y, CA_publicKeyY, 32); // set the sw Public Key Y
+        } else {
+            memcpy(public_key_x, &buf[1], PUBLIC_KEY_PART_SIZE);
+            memcpy(public_key_y, &buf[33], PUBLIC_KEY_PART_SIZE);
+        }
+        verify_ecdsa_certificate_result = verify_ecdsa_signature(msg, msg_len, public_key_x, public_key_y, certR, certS);
+    }
+
+    verify_ecdsa_certificate_peformed = true;
+    kfree(msg);
+
+    return count; // Return number of bytes written
+}
+
+static ssize_t ds28e30_verify_ecdsa_certificate_read(struct file *filp, struct kobject *kobj,
+                                                     struct bin_attribute *bin_attr, char *buf,
+                                                     loff_t off, size_t count)
+{
+    const char *result_str;
+    size_t result_len;
+
+    if (off != 0) {
+        return 0; // Only allow reads from the beginning
+    }
+
+    if (!buf) {
+        return -EINVAL; // Null buffer pointer
+    }
+
+    if (count == 0) {
+        return -EINVAL; // Invalid count size
+    }
+    if(verify_ecdsa_certificate_peformed == true)
+    {
+        // Determine the result string based on verify_ecdsa_certificate_result
+        if (verify_ecdsa_certificate_result == 0) {
+            result_str = "PASS";
+        } else {
+            result_str = "FAIL";
+        }
+        verify_ecdsa_certificate_peformed = false;
+    }
+    else{
+            result_str = "VERIFICATION_NOT_PERFORMED";
+    }
+
+    result_len = strlen(result_str);
+
+    // Ensure we do not overflow the buffer
+    if (count < result_len + 1) {
+        return -EINVAL; // Provided buffer is too small
+    }
+
+    // Copy result string to buf
+    memcpy(buf, result_str, result_len);
+    buf[result_len] = '\0'; // Null-terminate the string
+
+    return result_len; // Return the number of bytes written to buf
+}
+
 // Define Binary Attributes
 static BIN_ATTR_RO(rom, ROM_SIZE);
 static BIN_ATTR_RO(man_id_hwrev, MAN_ID_HWREV_SIZE);
@@ -821,6 +1584,13 @@ static BIN_ATTR_RW(page0, DS28E30_PAGE_SIZE);
 static BIN_ATTR_RW(page1, DS28E30_PAGE_SIZE);
 static BIN_ATTR_RW(page2, DS28E30_PAGE_SIZE);
 static BIN_ATTR_RW(page3, DS28E30_PAGE_SIZE);
+static BIN_ATTR_RO(ds28e30_pub_key, PUBLIC_KEY_PART_SIZE*2);
+static BIN_ATTR_RW(page_decrement_counter, DS28E30_PAGE_SIZE);
+static BIN_ATTR_WO(decrement_counter, 0);
+static BIN_ATTR_WO(ds28e30_device_disable, 0);
+static BIN_ATTR_RW(ds28e30_comp_rd_pg_auth, READ_PG_AUTH_SIG_SIZE);
+static BIN_ATTR_WO(ds28e30_auth_ecdsa_write_mem, ECDSA_AUTH_WRITE_MEM_SIZE);
+static BIN_ATTR_RW(ds28e30_verify_ecdsa_certificate, 0);
 
 // Attribute Group
 static struct bin_attribute *w1_ds28e30_bin_attrs[] = {
@@ -834,6 +1604,13 @@ static struct bin_attribute *w1_ds28e30_bin_attrs[] = {
     &bin_attr_page1,
     &bin_attr_page2,
     &bin_attr_page3,
+    &bin_attr_ds28e30_pub_key,
+    &bin_attr_page_decrement_counter,
+    &bin_attr_decrement_counter,
+    &bin_attr_ds28e30_device_disable,
+    &bin_attr_ds28e30_comp_rd_pg_auth,
+    &bin_attr_ds28e30_auth_ecdsa_write_mem,
+    &bin_attr_ds28e30_verify_ecdsa_certificate,
     NULL,
 };
 
