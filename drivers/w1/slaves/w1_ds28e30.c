@@ -192,28 +192,26 @@ static int w1_ds28e30_standard_cmd_flow(struct w1_slave *sl, u8 *write_buf, int 
     u8 pkt[256];
     int pkt_len = 0;
     int i;
+    int ret = 0;
 
     mutex_lock(&sl->master->bus_mutex);
 
     // Reset/presence
-    // Note: Assuming OWSkipROM() is a placeholder for a 1-Wire reset operation
-    if (0 != w1_reset_select_slave(sl)) {
-        return -1;
+    if (w1_reset_select_slave(sl) != 0) {
+        ret = -1;
+        goto out;
     }
+
     last_result_byte = RESULT_FAIL_COMMUNICATION;
 
     // Construct write block, start with XPC command
     pkt[pkt_len++] = XPC_COMMAND;
-
-    // Add length
     pkt[pkt_len++] = write_len;
-
-    // Write data buffer
     memcpy(&pkt[pkt_len], write_buf, write_len);
     pkt_len += write_len;
 
     // Send packet to DS28E30
-    w1_write_block(sl->master, pkt, pkt_len); // Assuming NULL for dev because w1_write_block does not use dev parameter
+    w1_write_block(sl->master, pkt, pkt_len);
 
     // Read two CRC bytes
     pkt[pkt_len++] = w1_read_8(sl->master);
@@ -226,48 +224,50 @@ static int w1_ds28e30_standard_cmd_flow(struct w1_slave *sl, u8 *write_buf, int 
     }
 
     if (crc_16 != 0xB001) {
-        return -1;
+        ret = -1;
+        goto out;
     }
 
     w1_next_pullup(sl->master, delay_ms);
-    // Send release byte, start strong pull-up
     w1_write_8(sl->master, 0xAA);
-    // Turn off strong pull-up
-    // OWLevel(MODE_NORMAL); // Assuming this function controls the 1-Wire bus mode
 
     // Read FF and the length byte
     pkt[0] = w1_read_8(sl->master);
     pkt[1] = w1_read_8(sl->master);
     *read_len = pkt[1];
 
-    // Ensure there is a valid length
-    if (*read_len != RESULT_FAIL_COMMUNICATION) {
-        // Read packet
-        w1_read_block(sl->master, read_buf, *read_len + 2);
-
-        // Check crc_16
-        crc_16 = 0;
-        do_crc_16(*read_len);
-        for (i = 0; i < (*read_len + 2); i++) {
-            do_crc_16(read_buf[i]);
-        }
-
-        if (crc_16 != 0xB001) {
-            return -1;
-        }
-
-        if (expect_read_len != *read_len) {
-            return -1;
-        }
-    } else {
-        return -1;
+    if (*read_len == RESULT_FAIL_COMMUNICATION) {
+        ret = -1;
+        goto out;
     }
 
-   	mutex_unlock(&sl->master->bus_mutex);
+    // Read packet
+    w1_read_block(sl->master, read_buf, *read_len + 2);
 
-    // Success
-    return 0;
+    // Check crc_16
+    crc_16 = 0;
+    do_crc_16(*read_len);
+    for (i = 0; i < (*read_len + 2); i++) {
+        do_crc_16(read_buf[i]);
+    }
+
+    if (crc_16 != 0xB001) {
+        ret = -1;
+        goto out;
+    }
+
+    if (expect_read_len != *read_len) {
+        ret = -1;
+        goto out;
+    }
+
+    ret = 0;
+
+out:
+    mutex_unlock(&sl->master->bus_mutex);
+    return ret;
 }
+
 
 int w1_ds28e30_cmd_writeMemory(struct w1_slave *sl, int pg, u8 *data)
 {
