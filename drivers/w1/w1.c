@@ -120,16 +120,41 @@ static ssize_t rw_write(struct file *filp, struct kobject *kobj,
 			size_t count)
 {
 	struct w1_slave *sl = kobj_to_w1_slave(kobj);
+    int reset_select = buf[0]; // Assuming the first byte is the pull-up duration
+	int pullup_duration = buf[1]; // Assuming the first byte is the pull-up duration
 
+	// Lock the mutex for the device
 	mutex_lock(&sl->master->mutex);
-	if (w1_reset_select_slave(sl)) {
-		count = 0;
-		goto out_up;
+
+	// Reset bus if the reset_select is 1
+	if(reset_select == 1)
+	{
+	    if (w1_reset_bus(sl->master)) {
+	    	count = 0; // No data written
+	    	goto out_up;
+	    }
 	}
 
-	w1_write_block(sl->master, buf, count);
+	// Reset and select slave if reset_select is 2
+	else if(reset_select == 2)
+	{
+	    if (w1_reset_select_slave(sl)) {
+	    	count = 0; // No data written
+	    	goto out_up;
+	    }
+	}
+
+	// If the pull-up duration is greater than 0, apply it before the write
+	if (pullup_duration > 0) {
+		// Call w1_next_pullup to apply the pull-up duration
+		w1_next_pullup(sl->master, pullup_duration);
+	}
+
+	// Write data to the device
+	w1_write_block(sl->master, buf + 2, count - 2); // Skip the first byte (pull-up duration)
 
 out_up:
+	// Unlock the mutex and return the written count
 	mutex_unlock(&sl->master->mutex);
 	return count;
 }
