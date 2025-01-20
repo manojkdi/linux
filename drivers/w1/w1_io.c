@@ -19,7 +19,7 @@ static int w1_delay_parm = 1;
 module_param_named(delay_coef, w1_delay_parm, int, 0);
 
 static int w1_disable_irqs = 1;
-module_param_named(disable_irqs, w1_disable_irqs, int, 0);
+module_param_named(disable_irqs, w1_disable_irqs, int, 1);
 
 static u8 w1_crc8_table[] = {
 	0, 94, 188, 226, 97, 63, 221, 131, 194, 156, 126, 32, 163, 253, 31, 65,
@@ -54,42 +54,28 @@ static u8 w1_crc8_table[] = {
  * For more details, please refer to the following resource:
  * [1-Wire Communication Through Software](https://www.analog.com/en/resources/technical-articles/1wire-communication-through-software.html)
  */
-static void w1_delay(struct w1_master *dev, unsigned long delay_ns)
-{
-    ktime_t start, delta;
-    unsigned long delay_us, delay_remainder_ns;
+static inline void w1_delay(struct w1_master *dev, unsigned long delay_ns) {
+    unsigned long us = delay_ns / 1000;  // Microseconds part
+    unsigned long remaining_ns = delay_ns % 1000;  // Remaining nanoseconds
 
-	if(delay_ns == 0)
-	{
-		return;
-	}
+    // Record the time before applying the delay (start time)
+    ktime_t start_time = ktime_get();
 
-    if (!dev->bus_master->delay_needs_poll) {
-        delay_us = delay_ns / 1000; // convert nanoseconds to microseconds
-        delay_remainder_ns = delay_ns % 1000; // remainder in nanoseconds
-
-        if (delay_us > 0)
-            udelay(delay_us * w1_delay_parm);
-        if (delay_remainder_ns > 0)
-            ndelay(delay_remainder_ns * w1_delay_parm);
-
-        return;
+    // Handle microsecond-level delay using udelay
+    if (us) {
+        udelay(us);  // Handles microsecond-level delay
     }
 
-    start = ktime_get();
-    delta = ktime_add(start, ns_to_ktime(delay_ns * w1_delay_parm));
-    do {
-        dev->bus_master->read_bit(dev->bus_master->data);
-        if (delay_ns > 1000) {
-            udelay(1); // delay of 1 microsecond
-            delay_ns -= 1000;
-        } else {
-            ndelay(delay_ns); // delay of remaining nanoseconds
-            delay_ns = 0;
-        }
-    } while (ktime_before(ktime_get(), delta));
-}
+    // Busy-wait loop for the nanosecond-level delay
+    if (remaining_ns) {
+        ktime_t target_time = ktime_add(start_time, ns_to_ktime(delay_ns));
 
+        // Busy-wait loop: keep checking until the desired delay is reached
+        while (ktime_before(ktime_get(), target_time)) {
+            // This loop will waste CPU time, but ensures accuracy for short delays
+        }
+    }
+}
 
 
 static void w1_write_bit(struct w1_master *dev, int bit);
@@ -178,11 +164,11 @@ static void w1_write_bit(struct w1_master *dev, int bit)
  */
 static void w1_pre_write(struct w1_master *dev)
 {
-	if (dev->pullup_duration &&
-		dev->enable_pullup && dev->bus_master->set_pullup) {
-		dev->bus_master->set_pullup(dev->bus_master->data,
-			dev->pullup_duration);
-	}
+    if (dev->pullup_duration &&
+        dev->enable_pullup && dev->bus_master->set_pullup) {
+        dev->bus_master->set_pullup(dev->bus_master->data,
+            dev->pullup_duration);
+    }
 }
 
 /**
@@ -240,6 +226,7 @@ static u8 w1_read_bit(struct w1_master *dev)
     unsigned long flags = 0;
     s64 delay_ns;
     struct w1_gpio_platform_data *pdata = (struct w1_gpio_platform_data *)dev->bus_master->data;
+    //u64 timestamp_before, timestamp_after;
 
     if (!pdata) {
         pr_err("w1_read_bit: Platform data (pdata) is NULL!\n");
@@ -248,6 +235,10 @@ static u8 w1_read_bit(struct w1_master *dev)
 
     /* sample timing is critical here */
     local_irq_save(flags);
+
+    // Get timestamp before write_bit
+    //timestamp_before = ktime_get_ns();
+    //pr_info("w1_read_bit: Timestamp before write_bit: %llu ns\n", timestamp_before);
 
     dev->bus_master->write_bit(dev->bus_master->data, 0);
 
@@ -262,6 +253,10 @@ static u8 w1_read_bit(struct w1_master *dev)
     w1_delay(dev, delay_ns);
 
     result = dev->bus_master->read_bit(dev->bus_master->data);
+
+    // Get timestamp after read_bit
+    //timestamp_after = ktime_get_ns();
+    //pr_info("w1_read_bit: Timestamp after read_bit: %llu ns\n", timestamp_after);
 
     local_irq_restore(flags);
 

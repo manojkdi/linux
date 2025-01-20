@@ -20,16 +20,16 @@
                 //index 0 is delay value for standard mode and index 1 is delay value for overdrive mode
                 //Note: tSLOT = tW0L + tREC.   As well,  tRL = tW1L.  tRSTH = tPDH + tPDL + tREC in some 1w devices.
                 w1_delay_values = /bits/ 64 <
-                    6000    1000    // Initialization low pulse duration and release   (A/tW1L)
-                    64000   7500    // Presence detect wait and sample                 (B/tSLOT-tW1L)
+                    6000    600    // Initialization low pulse duration and release    (A/tW1L)
+                    64000   10500   // Presence detect wait and sample                 (B/tSLOT-tW1L)
                     60000   7500    // Recovery time between commands                  (C/tW0L)
                     10000   5000    // Write 1 low pulse and recovery                  (D/tREC)
-                    9000    1000    // Write 0 low pulse and recovery                  (E/tW0L )
-                    55000   7000    // Read low pulse and sample                       (F/tSLOT-tMSR)
-                    0       2500    // Bus idle time between operations                (G/tREC directly prior to 1w reset cylce)
+                    9000    600     // sample time                                     (E/tMSR-tRL)
+                    55000   9000    // Read low pulse and sample                       (F/tSLOT-tMSR)
+                    0       5000    // Bus idle time between operations                (G/tREC directly prior to 1w reset cylce)
                     480000  50000   // Initialization high pulse duration and recovery (H/tRSTL)
                     70000   10000   // Overdrive initialization low pulse and release  (I/tMSP)
-                    485000  50000   // Overdrive presence detect wait and sample       (J/tRSTH-tMSP)
+                    485000  41000   // Overdrive presence detect wait and sample       (J/tRSTH-tMSP)
                 >;
 
                 // Average timing values for writing bitto GPIO pin (in nanoseconds)
@@ -48,7 +48,9 @@
             w1_pins: w1_pins {
                 brcm,pins = <4>;
                 brcm,function = <0>; // in (initially)
-                brcm,pull = <0>; // off
+                brcm,pull = <2>; // off
+                brcm,drive-strength = <12>; /* Set drive strength */
+                status = "okay"; // Explicitly enabling the fragment
             };
         };
     };

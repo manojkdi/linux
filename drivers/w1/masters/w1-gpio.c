@@ -151,18 +151,17 @@ static int w1_gpio_probe(struct platform_device *pdev)
                 dev_warn(&pdev->dev, "Failed to read w1_delay_values\n");
                 // Use default values if reading failed
                 static u64 w1_delay_values[10][2] = {
-                    {6 * 1000,    1 * 1000},
-                    {64 * 1000,   7.5 * 1000},
+                    {6 * 1000,    .75 * 1000},
+                    {64 * 1000,   10.5 * 1000},
                     {60 * 1000,   7.5 * 1000},
                     {10 * 1000,   5 * 1000},
-                    {9 * 1000,    0.5 * 1000}, // changed from 1 to 0.5 for overdrive
-                    {55 * 1000,   7 * 1000},
-                    {0 * 1000,    2.5 * 1000},
+                    {9 * 1000,    0.75 * 1000}, // changed from 1 to 0.5 for overdrive
+                    {55 * 1000,   9 * 1000},
+                    {0 * 1000,    5 * 1000},
                     {480 * 1000,  50 * 1000}, // changed from 70 to 50 for overdrive
                     {70 * 1000,   10 * 1000},
-                    {485 * 1000,  50 * 1000}
+                    {485 * 1000,  41 * 1000}
                 };
-
                 memcpy(pdata->w1_delay_values, w1_delay_values, sizeof(w1_delay_values));
             } else {
                 // Populate pdata->w1_delay_values and print each pair
@@ -180,18 +179,17 @@ static int w1_gpio_probe(struct platform_device *pdev)
             dev_info(&pdev->dev, "w1_delay_values property not found in device tree\n");
             // Use default values if property is not found
             static u64 w1_delay_values[10][2] = {
-                {6 * 1000,    1 * 1000},
-                {64 * 1000,   7.5 * 1000},
+                {6 * 1000,    .75 * 1000},
+                {64 * 1000,   10.5 * 1000},
                 {60 * 1000,   7.5 * 1000},
                 {10 * 1000,   5 * 1000},
-                {9 * 1000,    0.5 * 1000}, // changed from 1 to 0.5 for overdrive
-                {55 * 1000,   7 * 1000},
-                {0 * 1000,    2.5 * 1000},
+                {9 * 1000,    0.75 * 1000}, // changed from 1 to 0.5 for overdrive
+                {55 * 1000,   9 * 1000},
+                {0 * 1000,    5 * 1000},
                 {480 * 1000,  50 * 1000}, // changed from 70 to 50 for overdrive
                 {70 * 1000,   10 * 1000},
-                {485 * 1000,  50 * 1000}
+                {485 * 1000,  41 * 1000}
             };
-
             memcpy(pdata->w1_delay_values, w1_delay_values, sizeof(w1_delay_values));
         }
 
@@ -213,6 +211,7 @@ static int w1_gpio_probe(struct platform_device *pdev)
 
     pdata->pullup_gpiod =
         devm_gpiod_get_index_optional(dev, NULL, 1, GPIOD_OUT_LOW);
+
     if (IS_ERR(pdata->pullup_gpiod)) {
 		dev_err(dev, "gpio_request_one "
 			"(ext_pullup_enable_pin) failed\n");

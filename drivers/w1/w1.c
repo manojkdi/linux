@@ -121,7 +121,11 @@ static ssize_t rw_write(struct file *filp, struct kobject *kobj,
 {
 	struct w1_slave *sl = kobj_to_w1_slave(kobj);
     int reset_select = buf[0]; // Assuming the first byte is the pull-up duration
-	int pullup_duration = buf[1]; // Assuming the first byte is the pull-up duration
+	int pullup_duration = 0;
+    pullup_duration |= (buf[1] << 24);
+    pullup_duration |= (buf[2] << 16);
+    pullup_duration |= (buf[3] << 8);
+    pullup_duration |= buf[4];
 
 	// Lock the mutex for the device
 	mutex_lock(&sl->master->mutex);
@@ -147,11 +151,13 @@ static ssize_t rw_write(struct file *filp, struct kobject *kobj,
 	// If the pull-up duration is greater than 0, apply it before the write
 	if (pullup_duration > 0) {
 		// Call w1_next_pullup to apply the pull-up duration
+	    printk(KERN_INFO "trequested pull up duration is %d ms", pullup_duration);
 		w1_next_pullup(sl->master, pullup_duration);
+
 	}
 
 	// Write data to the device
-	w1_write_block(sl->master, buf + 2, count - 2); // Skip the first byte (pull-up duration)
+	w1_write_block(sl->master, buf + 5, count - 5); // Skip the first byte (pull-up duration)
 
 out_up:
 	// Unlock the mutex and return the written count
