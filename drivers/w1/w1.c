@@ -151,7 +151,6 @@ static ssize_t rw_write(struct file *filp, struct kobject *kobj,
 	// If the pull-up duration is greater than 0, apply it before the write
 	if (pullup_duration > 0) {
 		// Call w1_next_pullup to apply the pull-up duration
-	    printk(KERN_INFO "trequested pull up duration is %d ms", pullup_duration);
 		w1_next_pullup(sl->master, pullup_duration);
 
 	}
