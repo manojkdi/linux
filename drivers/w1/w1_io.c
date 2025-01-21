@@ -68,7 +68,7 @@ static inline void w1_delay(struct w1_master *dev, unsigned long delay_ns) {
 
     // Busy-wait loop for the nanosecond-level delay
     if (remaining_ns) {
-        ktime_t target_time = ktime_add(start_time, ns_to_ktime(delay_ns));
+        ktime_t target_time = ktime_add(start_time, ns_to_ktime(remaining_ns));
 
         // Busy-wait loop: keep checking until the desired delay is reached
         while (ktime_before(ktime_get(), target_time)) {
@@ -233,8 +233,8 @@ static u8 w1_read_bit(struct w1_master *dev)
         return 0;  // Or handle the error appropriately
     }
 
-    /* sample timing is critical here */
-    local_irq_save(flags);
+    if (w1_disable_irqs)
+        local_irq_save(flags);
 
     // Get timestamp before write_bit
     //timestamp_before = ktime_get_ns();
@@ -257,8 +257,8 @@ static u8 w1_read_bit(struct w1_master *dev)
     // Get timestamp after read_bit
     //timestamp_after = ktime_get_ns();
     //pr_info("w1_read_bit: Timestamp after read_bit: %llu ns\n", timestamp_after);
-
-    local_irq_restore(flags);
+    if (w1_disable_irqs)
+        local_irq_restore(flags);
 
     // Adjust delay for the subsequent operation (if any)
     delay_ns = pdata->w1_delay_values[5][dev->overdrive_mode_active] - pdata->read_bit_avg_ns;
@@ -525,7 +525,6 @@ void w1_search_devices(struct w1_master *dev, u8 search_type, w1_slave_found_cal
 int w1_reset_select_slave(struct w1_slave *sl)
 {
 	u8 match[9] = {};
-	printk(KERN_DEBUG "reset select slave called\n");
 
     if (w1_reset_bus(sl->master))
 	    return -1;
